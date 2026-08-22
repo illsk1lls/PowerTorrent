@@ -3921,7 +3921,7 @@ function Read-PtIni {
 		else { return $map }
 	}
 	try {
-		foreach ($line in @(Get-Content -LiteralPath $p -ErrorAction Stop)) {
+		foreach ($line in @(Get-Content -LiteralPath $p -Encoding UTF8 -ErrorAction Stop)) {
 			$t = [string]$line
 			if ($t.Trim().Length -eq 0) { continue }
 			if ($t.StartsWith(';') -or $t.StartsWith('#') -or $t.StartsWith('[')) { continue }
@@ -3957,7 +3957,7 @@ function Write-PtIni {
 			[void]$lines.Add(('{0}={1}' -f $k, [string]$Map[$k]))
 		}
 	}
-	Set-Content -LiteralPath $p -Value $lines.ToArray() -Encoding ASCII
+	Set-Content -LiteralPath $p -Value $lines.ToArray() -Encoding UTF8
 }
 
 function Merge-PtIni {
