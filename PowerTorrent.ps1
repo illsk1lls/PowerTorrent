@@ -96,7 +96,7 @@
 
 .NOTES
 	Settings live in PowerTorrent.ini next to the script. An imported VPN
-	config is PowerTorrent.vpn.conf, same folder.
+	config stays in memory unless you save options, then it is stored in that file.
 #>
 [CmdletBinding()]
 param(
@@ -160,6 +160,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Pipes;
 using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
@@ -172,6 +173,82 @@ using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 
 namespace PowerTorrent {
+
+	public static class IpcHub {
+		const string PipeName = "PowerTorrent";
+		static readonly object gate = new object();
+		static readonly List<string> q = new List<string>();
+		static volatile bool run;
+		static Thread thr;
+		static NamedPipeServerStream pipe;
+		public static void Start() {
+			if (thr != null) return;
+			run = true;
+			thr = new Thread(Loop);
+			thr.IsBackground = true;
+			thr.Name = "pt-ipc";
+			thr.Start();
+		}
+		public static void Stop() {
+			run = false;
+			try {
+				NamedPipeClientStream c = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
+				c.Connect(200);
+				c.Dispose();
+			} catch { }
+			try { if (pipe != null) pipe.Dispose(); } catch { }
+			try { if (thr != null) thr.Join(1000); } catch { }
+			thr = null;
+			pipe = null;
+		}
+		public static bool Send(string source) {
+			if (string.IsNullOrEmpty(source)) return false;
+			try {
+				using (NamedPipeClientStream c = new NamedPipeClientStream(".", PipeName, PipeDirection.Out)) {
+					c.Connect(2000);
+					using (StreamWriter sw = new StreamWriter(c, Encoding.UTF8)) {
+						sw.WriteLine(source);
+						sw.Flush();
+					}
+				}
+				return true;
+			} catch { return false; }
+		}
+		public static string[] Drain() {
+			lock (gate) {
+				if (q.Count == 0) return new string[0];
+				string[] a = q.ToArray();
+				q.Clear();
+				return a;
+			}
+		}
+		static void Loop() {
+			while (run) {
+				NamedPipeServerStream p = null;
+				try {
+					p = new NamedPipeServerStream(PipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.None);
+					pipe = p;
+					p.WaitForConnection();
+					if (!run) break;
+					StreamReader sr = new StreamReader(p, Encoding.UTF8);
+					string all = sr.ReadToEnd();
+					try { sr.Dispose(); } catch { }
+					if (string.IsNullOrEmpty(all)) continue;
+					string[] lines = all.Replace("\r", "").Split('\n');
+					lock (gate) {
+						for (int i = 0; i < lines.Length; i++) {
+							string t = lines[i].Trim();
+							if (t.Length > 0) q.Add(t);
+						}
+					}
+				} catch { if (!run) break; }
+				finally {
+					pipe = null;
+					try { if (p != null) p.Dispose(); } catch { }
+				}
+			}
+		}
+	}
 
 	public sealed class EngineSettings {
 		public string TorrentPath;
@@ -515,10 +592,8 @@ namespace PowerTorrent {
 					if (parsed.AddressFamily == AddressFamily.InterNetwork) return parsed;
 					return null;
 				}
-				if (VpnHub.HasConfig) {
-					if (!VpnHub.TunnelOn) return null;
-					return VpnHub.Resolve(host);
-				}
+				if (VpnHub.TunnelOn) return VpnHub.Resolve(host);
+				if (VpnHub.Blocked) return null;
 				IPAddress[] addrs = Dns.GetHostAddresses(host);
 				for (int i = 0; i < addrs.Length; i++) {
 					if (addrs[i].AddressFamily == AddressFamily.InterNetwork) return addrs[i];
@@ -860,12 +935,12 @@ namespace PowerTorrent {
 			Transport = "TCP/WG";
 		}
 		public static TcpPeerIo Dial(string host, int port, int timeoutMs) {
-			if (VpnHub.HasConfig) {
-				if (!VpnHub.TunnelOn) return null;
+			if (VpnHub.TunnelOn) {
 				VpnTcp v = VpnHub.ConnectTcp(host, port, timeoutMs);
 				if (v == null) return null;
 				return new TcpPeerIo(v);
 			}
+			if (VpnHub.Blocked) return null;
 			TcpClient c = new TcpClient();
 			c.NoDelay = true;
 			c.ReceiveBufferSize = 512 * 1024;
@@ -1528,9 +1603,9 @@ namespace PowerTorrent {
 		public UtpHub(Engine e) { this.eng = e; }
 
 		public bool Start(int port) {
-			if (VpnHub.HasConfig && !VpnHub.TunnelOn) return false;
+			if (VpnHub.Blocked) return false;
 			try {
-				if (VpnHub.HasConfig) {
+				if (VpnHub.TunnelOn) {
 					vudp = VpnHub.BindUdp(port);
 					Port = vudp.locPort;
 				} else {
@@ -1569,7 +1644,7 @@ namespace PowerTorrent {
 			lock (gate) map[Key(c.Remote, c.RecvId)] = c;
 		}
 		public UtpConn Connect(string host, int port, int timeoutMs) {
-			if (VpnHub.HasConfig && !VpnHub.TunnelOn) return null;
+			if (VpnHub.Blocked) return null;
 			UtpConn c = new UtpConn(this);
 			if (!c.Connect(host, port, timeoutMs)) return null;
 			return c;
@@ -1935,7 +2010,7 @@ namespace PowerTorrent {
 
 	internal sealed class VpnTcp {
 		internal const int Mss = 1280;
-		internal const int MaxFlight = 1024 * 1280;
+		internal const int MaxFlight = 4096 * 1280;
 		internal const int WScale = 8;
 		internal uint remIp, locIp; internal ushort remPort, locPort;
 		internal int state;
@@ -2866,6 +2941,10 @@ namespace PowerTorrent {
 		public static string Status = "off";
 		public static string ProvenIp = "";
 		public static bool ProbeDone;
+		public static bool DroppedWhileUp;
+		public static bool HandshakeTimedOut;
+		public static string DirectIp = "";
+		public static bool ProbeFailed;
 		public static string EndpointHost {
 			get { return endpoint == null ? "" : endpoint.ToString(); }
 		}
@@ -2882,7 +2961,8 @@ namespace PowerTorrent {
 		static byte[] sendKey, recvKey;
 		static uint localIndex, remoteIndex, hsLocalIndex;
 		static ulong sendCtr, recvCtr;
-		static DateTime lastHs = DateTime.MinValue, lastHsOk = DateTime.MinValue, lastData = DateTime.MinValue, lastRecv = DateTime.MinValue;
+		static DateTime lastHs = DateTime.MinValue, lastHsOk = DateTime.MinValue, lastData = DateTime.MinValue, lastRecv = DateTime.MinValue, connectAt = DateTime.MinValue;
+		static bool handshakeWarnSent;
 		static byte[] hsCk, hsHash, ephPriv, ephPub, staticPub;
 		static readonly object gate = new object();
 		static readonly object udpGate = new object();
@@ -2897,7 +2977,7 @@ namespace PowerTorrent {
 		public static bool TunnelOn { get { return up; } }
 		public static bool HasConfig { get { return vpnKind != 0; } }
 		public static string Kind { get { return vpnKind == 2 ? "OpenVPN" : (vpnKind == 1 ? "WireGuard" : ""); } }
-		public static bool Blocked { get { return HasConfig && !up; } }
+		public static bool Blocked { get { return Require && HasConfig && !up; } }
 		public static int Mtu { get { return mtu; } }
 		public static string LocalAddress {
 			get { return localIp == 0 ? "" : string.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}.{3}", (localIp >> 24) & 255, (localIp >> 16) & 255, (localIp >> 8) & 255, localIp & 255); }
@@ -2967,11 +3047,10 @@ namespace PowerTorrent {
 				return LoadWireGuard(text, out err);
 			OvpnSess parsed;
 			if (OvpnSess.TryParse(text, out parsed, out err)) {
-				Stop();
+				StopCore(true);
 				if (!parsed.Resolve(out err)) err = "";
 				lock (gate) {
 					vpnKind = 2; ovpnRaw = text; ovpn = parsed;
-					Require = true;
 					priv = null; peerPub = null; psk = null; staticPub = null;
 					endpoint = parsed.Endpoint;
 					localIp = 0; dnsIp = 0;
@@ -3026,9 +3105,9 @@ namespace PowerTorrent {
 				int c = ep.LastIndexOf(':');
 				if (c < 1) { err = "Endpoint must be ip:port"; return false; }
 				IPEndPoint nep = new IPEndPoint(IPAddress.Parse(ep.Substring(0, c)), int.Parse(ep.Substring(c + 1), CultureInfo.InvariantCulture));
+				StopCore(true);
 				lock (gate) {
 					vpnKind = 1; ovpnRaw = null; ovpn = null;
-					Require = true;
 					priv = np; peerPub = npp; psk = npsk;
 					staticPub = X25519.PublicFromPrivate(priv);
 					localIp = nip; dnsIp = ndns; endpoint = nep;
@@ -3061,7 +3140,12 @@ namespace PowerTorrent {
 				}
 				udp = new UdpClient(0, AddressFamily.InterNetwork);
 				udp.Client.ReceiveTimeout = 200;
+				TuneUdp(udp);
 				run = true; up = false;
+				DroppedWhileUp = false;
+				HandshakeTimedOut = false;
+				handshakeWarnSent = false;
+				connectAt = DateTime.UtcNow;
 				Status = "connecting"; LastError = "";
 				if (vpnKind == 2) {
 					thr = new Thread(LoopOvpn); thr.IsBackground = true; thr.Name = "pt-ovpn"; thr.Start();
@@ -3079,6 +3163,7 @@ namespace PowerTorrent {
 			while (!up && DateTime.UtcNow < dead) Thread.Sleep(50);
 			if (!up) {
 				if (string.IsNullOrEmpty(LastError)) LastError = "handshake timeout to " + endpoint;
+				if (Require) HandshakeTimedOut = true;
 				StopCore(true); return false;
 			}
 			Status = "up " + LocalAddress + " via " + endpoint; LastError = "";
@@ -3086,14 +3171,34 @@ namespace PowerTorrent {
 			return true;
 		}
 
-		public static void Stop() { StopCore(true); }
+		public static void Stop() {
+			bool warn = up && Require;
+			StopCore(true);
+			if (warn) DroppedWhileUp = true;
+		}
+
+		static void TuneUdp(UdpClient u) {
+			if (u == null || u.Client == null) return;
+			Socket s = u.Client;
+			try { s.ReceiveTimeout = 200; } catch { }
+			try { s.ReceiveBufferSize = 4 * 1024 * 1024; } catch { }
+			try { s.SendBufferSize = 4 * 1024 * 1024; } catch { }
+			try { s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 4 * 1024 * 1024); } catch { }
+			try { s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 4 * 1024 * 1024); } catch { }
+			try {
+				byte[] outb = new byte[4];
+				s.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, outb);
+			} catch { }
+		}
 
 		static void StopCore(bool rebind) {
 			run = false; up = false;
 			lastHsOk = DateTime.MinValue;
 			Interlocked.Increment(ref probeGen);
 			ProvenIp = "";
+			DirectIp = "";
 			ProbeDone = false;
+			ProbeFailed = false;
 			try { if (ovpn != null) ovpn.Close(); } catch { }
 			try { if (udp != null) udp.Close(); } catch { }
 			udp = null;
@@ -3203,7 +3308,7 @@ namespace PowerTorrent {
 			List<VpnSeg> toSend = new List<VpnSeg>();
 			lock (t.gate) {
 				int cap = VpnTcp.MaxFlight;
-				if (t.peerWnd > 8192 && t.peerWnd < (uint)cap) cap = (int)t.peerWnd;
+				if (t.peerWnd > 16384 && t.peerWnd < (uint)cap) cap = (int)t.peerWnd;
 				int flightBytes = 0;
 				for (int i = 0; i < t.flight.Count; i++) flightBytes += t.flight[i].data.Length;
 				while (t.pending.Count > 0 && flightBytes < cap) {
@@ -3283,6 +3388,46 @@ namespace PowerTorrent {
 		}
 
 		static int probeGen;
+		static string HttpOsGet(string url, int timeoutMs) {
+			try {
+				try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
+				HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+				req.Method = "GET";
+				req.UserAgent = "curl/8.4.0";
+				req.Timeout = timeoutMs;
+				req.ReadWriteTimeout = timeoutMs;
+				req.KeepAlive = false;
+				req.AllowAutoRedirect = true;
+				try { req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate; } catch { }
+				using (WebResponse resp = req.GetResponse()) {
+					using (Stream s = resp.GetResponseStream()) {
+						if (s == null) return null;
+						MemoryStream ms = new MemoryStream();
+						byte[] buf = new byte[2048];
+						int n, total = 0;
+						while ((n = s.Read(buf, 0, buf.Length)) > 0) {
+							ms.Write(buf, 0, n);
+							total += n;
+							if (total > 8192) break;
+						}
+						return ParsePlainV4(ms.ToArray());
+					}
+				}
+			} catch { return null; }
+		}
+		static string ProbeOsOnce() {
+			string[] urls = new string[] {
+				"https://ip.me/",
+				"http://ip.me/",
+				"https://api.ipify.org/",
+				"https://icanhazip.com/"
+			};
+			for (int u = 0; u < urls.Length; u++) {
+				string ip = HttpOsGet(urls[u], 8000);
+				if (ip != null) return ip;
+			}
+			return null;
+		}
 		static string ParsePlainV4(byte[] body) {
 			if (body == null || body.Length == 0) return null;
 			string s = Encoding.ASCII.GetString(body).Trim();
@@ -3325,24 +3470,36 @@ namespace PowerTorrent {
 		}
 		static void ProbeWorker(object state) {
 			int g = (int)state;
+			string vpnIp = null;
+			string osIp = null;
 			for (int i = 0; i < 4 && up && g == probeGen; i++) {
 				try {
-					string ip = ProbeOnce();
+					if (vpnIp == null) vpnIp = ProbeOnce();
+					if (osIp == null) osIp = ProbeOsOnce();
 					if (g != probeGen) return;
-					if (ip != null) {
-						ProvenIp = ip;
+					if (vpnIp != null) ProvenIp = vpnIp;
+					if (osIp != null) DirectIp = osIp;
+					if (vpnIp != null && osIp != null) {
+						ProbeFailed = string.Equals(vpnIp, osIp, StringComparison.Ordinal);
 						ProbeDone = true;
-						Status = "up " + ip + " via " + endpoint;
+						if (!ProbeFailed) Status = "up " + vpnIp + " via " + endpoint;
+						else LastError = "VPN IP matches outside IP";
 						return;
 					}
 				} catch { }
 				Thread.Sleep(1500);
 			}
-			if (g == probeGen) ProbeDone = true;
+			if (g == probeGen) {
+				if (vpnIp != null) ProvenIp = vpnIp;
+				if (osIp != null) DirectIp = osIp;
+				ProbeDone = true;
+			}
 		}
 		static void BeginProbe() {
 			int g = Interlocked.Increment(ref probeGen);
 			ProbeDone = false;
+			ProbeFailed = false;
+			DirectIp = "";
 			Thread t = new Thread(ProbeWorker);
 			t.IsBackground = true;
 			t.Name = "pt-ipme";
@@ -3368,8 +3525,29 @@ namespace PowerTorrent {
 			up = true;
 			lastData = DateTime.UtcNow; lastRecv = DateTime.UtcNow;
 			Status = "up " + LocalAddress + " via " + endpoint; LastError = "";
+			HandshakeTimedOut = false;
 			try { Session.RebindListen(); } catch { }
 			BeginProbe();
+		}
+
+		static bool RecvPkt(out byte[] pkt) {
+			pkt = null;
+			UdpClient u = udp;
+			if (u == null) return false;
+			IPEndPoint any = new IPEndPoint(IPAddress.Any, 0);
+			try {
+				pkt = u.Receive(ref any);
+				return pkt != null && pkt.Length > 0;
+			} catch (SocketException) {
+				return false;
+			}
+		}
+		static int UdpQueued() {
+			try {
+				UdpClient u = udp;
+				if (u == null || u.Client == null) return 0;
+				return u.Available;
+			} catch { return 0; }
 		}
 
 		static void LoopOvpn() {
@@ -3379,23 +3557,27 @@ namespace PowerTorrent {
 			while (run) {
 				try {
 					o.Tick();
-					if (up && (DateTime.UtcNow - lastRecv).TotalSeconds > 180) {
-						up = false; Status = "reconnecting";
+					if (!up && Require && !handshakeWarnSent && connectAt != DateTime.MinValue && (DateTime.UtcNow - connectAt).TotalSeconds >= 25) {
+						HandshakeTimedOut = true; handshakeWarnSent = true;
+					}
+					if (run && up && (DateTime.UtcNow - lastRecv).TotalSeconds > 180) {
+						up = false; Status = "reconnecting"; LastError = "VPN dropped";
+						if (Require) DroppedWhileUp = true;
 						try { Session.RebindListen(); } catch { }
 					}
 					if (up && keepalive > 0 && (DateTime.UtcNow - lastData).TotalSeconds >= keepalive) {
 						o.SendPing(); lastData = DateTime.UtcNow;
 					}
-					IPEndPoint any = new IPEndPoint(IPAddress.Any, 0);
-					byte[] pkt = null;
-					try {
-						UdpClient u = udp;
-						if (u == null) break;
-						pkt = u.Receive(ref any);
-					} catch (SocketException) { TickTcp(); continue; }
-					if (pkt == null || pkt.Length < 1) continue;
-					o.OnPacket(pkt);
-					if ((++loopTicks & 15) == 0) TickTcp();
+					byte[] pkt;
+					if (!RecvPkt(out pkt)) { TickTcp(); continue; }
+					int n = 0;
+					while (pkt != null) {
+						o.OnPacket(pkt);
+						n++;
+						if (n >= 48 || UdpQueued() <= 0) break;
+						if (!RecvPkt(out pkt)) break;
+					}
+					if ((++loopTicks & 3) == 0) TickTcp();
 				} catch { if (!run) break; }
 			}
 		}
@@ -3406,31 +3588,35 @@ namespace PowerTorrent {
 				try {
 					DateTime now = DateTime.UtcNow;
 					if (!up) {
+						if (Require && !handshakeWarnSent && connectAt != DateTime.MinValue && (now - connectAt).TotalSeconds >= 25) {
+							HandshakeTimedOut = true; handshakeWarnSent = true;
+						}
 						if (lastHs == DateTime.MinValue || (now - lastHs).TotalSeconds >= 5) Initiate();
 					} else {
 						if (lastHsOk != DateTime.MinValue && (now - lastHsOk).TotalSeconds >= 120 && (now - lastHs).TotalSeconds >= 5)
 							Initiate();
-						if (lastHsOk != DateTime.MinValue && (now - lastHsOk).TotalSeconds >= 180) {
-							up = false; Status = "reconnecting";
+						if (run && lastHsOk != DateTime.MinValue && (now - lastHsOk).TotalSeconds >= 180) {
+							up = false; Status = "reconnecting"; LastError = "VPN dropped";
+							if (Require) DroppedWhileUp = true;
 							try { Session.RebindListen(); } catch { }
 						}
 					}
 					if (up && keepalive > 0 && (now - lastData).TotalSeconds >= keepalive) { WgSend(new byte[0]); lastData = DateTime.UtcNow; }
-					IPEndPoint any = new IPEndPoint(IPAddress.Any, 0);
-					byte[] pkt = null;
-					try {
-						UdpClient u = udp;
-						if (u == null) break;
-						pkt = u.Receive(ref any);
-					} catch (SocketException) { TickTcp(); continue; }
-					if (pkt == null || pkt.Length < 4) continue;
-					uint typ = BitConverter.ToUInt32(pkt, 0);
-					if (typ == 2) HandleResp(pkt);
-					else if (typ == 3) LastError = "server cookie (endpoint under load)";
-					else if (typ == 4) {
-						HandleData(pkt);
-						if ((++loopTicks & 31) == 0) TickTcp();
+					byte[] pkt;
+					if (!RecvPkt(out pkt)) { TickTcp(); continue; }
+					int n = 0;
+					while (pkt != null) {
+						if (pkt.Length >= 4) {
+							uint typ = BitConverter.ToUInt32(pkt, 0);
+							if (typ == 2) HandleResp(pkt);
+							else if (typ == 3) LastError = "server cookie (endpoint under load)";
+							else if (typ == 4) HandleData(pkt);
+						}
+						n++;
+						if (n >= 48 || UdpQueued() <= 0) break;
+						if (!RecvPkt(out pkt)) break;
 					}
+					if ((++loopTicks & 3) == 0) TickTcp();
 				} catch { if (!run) break; }
 			}
 		}
@@ -3499,6 +3685,7 @@ namespace PowerTorrent {
 				lastData = DateTime.UtcNow; lastRecv = DateTime.UtcNow; lastHsOk = DateTime.UtcNow;
 			}
 			Status = "up " + LocalAddress + " via " + endpoint; LastError = "";
+			HandshakeTimedOut = false;
 			try { Session.RebindListen(); } catch { }
 			WgSend(new byte[0]);
 			if (firstUp || string.IsNullOrEmpty(ProvenIp)) BeginProbe();
@@ -3564,6 +3751,7 @@ namespace PowerTorrent {
 			}
 			bool sendSynAckAck = false;
 			bool pump = false;
+			bool needAck = false;
 			VpnSeg fastRt = null;
 			lock (t.gate) {
 				if ((flags & 4) != 0) { t.rst = true; t.state = 0; t.ev.Set(); return; }
@@ -3610,29 +3798,30 @@ namespace PowerTorrent {
 							t.rcvNxt += (uint)more.Length;
 						}
 						t.ev.Set();
-						TcpSend(t, 0x10, null, t.sndNxt);
-					} else if ((int)(seq - t.rcvNxt) > 0 && (seq - t.rcvNxt) < 2097152u && t.ooo.Count < 96) {
+						needAck = true;
+					} else if ((int)(seq - t.rcvNxt) > 0 && (seq - t.rcvNxt) < 4194304u && t.ooo.Count < 256) {
 						if (!t.ooo.ContainsKey(seq)) {
 							byte[] chunk = new byte[payLen];
 							Buffer.BlockCopy(ip, payOff, chunk, 0, payLen);
 							t.ooo[seq] = chunk;
 						}
-						TcpSend(t, 0x10, null, t.sndNxt);
+						needAck = true;
 					} else if ((int)(seq - t.rcvNxt) <= 0) {
-						TcpSend(t, 0x10, null, t.sndNxt);
+						needAck = true;
 					}
 				}
 				if ((flags & 1) != 0 && t.state == 3) {
 					uint fseq = seq + (uint)payLen;
 					if (fseq == t.rcvNxt) {
-						t.rcvNxt++; TcpSend(t, 0x10, null, t.sndNxt); t.state = 4; t.ev.Set();
+						t.rcvNxt++; needAck = true; t.state = 4; t.ev.Set();
 					} else if (fseq > t.rcvNxt) { t.finSeen = true; t.finSeq = fseq; }
 				}
 				if (t.finSeen && t.state == 3 && t.rcvNxt == t.finSeq) {
-					t.rcvNxt++; TcpSend(t, 0x10, null, t.sndNxt); t.state = 4; t.ev.Set();
+					t.rcvNxt++; needAck = true; t.state = 4; t.ev.Set();
 				}
 			}
 			if (sendSynAckAck) { TcpSend(t, 0x10, null, t.sndNxt); t.ev.Set(); }
+			else if (needAck) TcpSend(t, 0x10, null, t.sndNxt);
 			if (fastRt != null) TcpSend(t, 0x18, fastRt.data, fastRt.seq);
 			if (pump) TcpPump(t);
 		}
@@ -3644,7 +3833,7 @@ namespace PowerTorrent {
 				VpnTcp t = list[i];
 				VpnSeg oldest = null;
 				lock (t.gate) {
-					if (t.flight.Count > 0 && (now - t.flight[0].sent).TotalMilliseconds > 400) {
+					if (t.flight.Count > 0 && (now - t.flight[0].sent).TotalMilliseconds > 250) {
 						t.flight[0].sent = now; oldest = t.flight[0];
 					}
 				}
@@ -3929,9 +4118,9 @@ namespace PowerTorrent {
 
 		public static int EnsureListen(int port, bool enableUtp) {
 			lock (gate) {
-				if (VpnHub.HasConfig && !VpnHub.TunnelOn) { StopListen_NoLock(); return 0; }
+				if (VpnHub.Blocked) { StopListen_NoLock(); return 0; }
 				if (port <= 0) port = 6881;
-				if (VpnHub.HasConfig) {
+				if (VpnHub.TunnelOn) {
 					if (vpnBound && boundPort > 0) {
 						if (enableUtp && utpHub == null) {
 							utpHub = new UtpHub();
@@ -4156,6 +4345,12 @@ namespace PowerTorrent {
 		long lastDl;
 		long lastUl;
 		DateTime lastSp = DateTime.UtcNow;
+		double[] spdWin = new double[30];
+		int spdN;
+		int spdI;
+		double spdSum;
+		double etaSmooth = -1;
+		double activeSecs;
 		DateTime lastRecycle = DateTime.MinValue;
 		int activePeerThreads;
 		Thread coordThread;
@@ -4497,16 +4692,28 @@ namespace PowerTorrent {
 				long share = (48L * 1024 * 1024) / nT;
 				int byMem = (int)(share / denom);
 				int cap = nT > 25 ? 16 : (nT > 10 ? 32 : 96);
+				if (VpnHub.TunnelOn) {
+					share = (96L * 1024 * 1024) / nT;
+					byMem = (int)(share / denom);
+					cap = Math.Max(cap, 64);
+				}
 				maxInFlight = Math.Max(4, Math.Min(cap, Math.Max(4, byMem)));
 			}
 
 			public bool IsComplete { get { return n == 0 || doneCount >= n; } }
 			public int DoneCount { get { return doneCount; } }
 			public bool IsEndgame() {
+				lock (gate) {
+					return RemainingUnrequested() == 0 && (n - doneCount) > 0;
+				}
+			}
+
+			bool FinishingNoLock() {
 				int left = n - doneCount;
 				if (left <= 0) return false;
-				if (left <= 4) return true;
-				return RemainingBlocks() <= 96;
+				if (left <= maxInFlight * 2) return true;
+				if (total > 0 && (total - verified) * 20L < total) return true;
+				return false;
 			}
 
 			public void Open() {
@@ -4515,7 +4722,7 @@ namespace PowerTorrent {
 					FileEnt f = m.Files[i];
 					string dir = Path.GetDirectoryName(f.Path);
 					if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
-					streams[i] = new FileStream(f.Path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite, 1024 * 1024, FileOptions.SequentialScan);
+					streams[i] = new FileStream(f.Path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite, 2 * 1024 * 1024, FileOptions.SequentialScan);
 					if (streams[i].Length != f.Length) streams[i].SetLength(f.Length);
 				}
 			}
@@ -4549,6 +4756,12 @@ namespace PowerTorrent {
 				int left = sz - off;
 				if (left <= 0) return 0;
 				return left > BS ? BS : left;
+			}
+			public int BlockLength(int piece, int begin) {
+				if (piece < 0 || piece >= n) return 16384;
+				int b = begin / BS;
+				int nbyte = BlockLen(piece, b);
+				return nbyte > 0 ? nbyte : 16384;
 			}
 
 			void IO(long offset, byte[] buffer, int bufOff, int len, bool write) {
@@ -4707,25 +4920,46 @@ namespace PowerTorrent {
 				return false;
 			}
 
-			bool HasFreeBlock(int idx, bool endgame) {
-				int bc = BlockCount(idx);
-				if (st[idx] == null) return true;
-				for (int b = 0; b < bc; b++) {
-					if (st[idx][b] == 0) return true;
-					if (endgame && st[idx][b] == 1) return true;
+			static bool PeerHolds(List<int> haveP, List<int> haveB, int p, int begin) {
+				if (haveP == null || haveB == null) return false;
+				for (int i = 0; i < haveP.Count; i++) {
+					if (haveP[i] == p && haveB[i] == begin) return true;
 				}
 				return false;
 			}
 
-			int Pick(BitArray has, bool sequential, bool endgame) {
+			bool HasFreeBlock(int idx, bool endgame, bool uniqueOnly, List<int> haveP, List<int> haveB) {
+				int bc = BlockCount(idx);
+				if (st[idx] == null) return true;
+				for (int b = 0; b < bc; b++) {
+					if (st[idx][b] == 0) return true;
+					if (!uniqueOnly && endgame && st[idx][b] == 1 && hits[idx] != null && hits[idx][b] < 3
+						&& !PeerHolds(haveP, haveB, idx, b * BS)) return true;
+				}
+				return false;
+			}
+
+			int RemainingUnrequested() {
+				int c = 0;
+				int cnt = open.Count;
+				for (int k = 0; k < cnt; k++) {
+					int i = open[k];
+					int bc = BlockCount(i);
+					if (st[i] == null) { c += bc; continue; }
+					for (int b = 0; b < bc; b++) if (st[i][b] == 0) c++;
+				}
+				return c;
+			}
+
+			int Pick(BitArray has, bool sequential, bool endgame, bool uniqueOnly, List<int> haveP, List<int> haveB) {
 				int best = -1;
 				int bestScore = int.MaxValue;
 				int cnt = open.Count;
 				for (int k = 0; k < cnt; k++) {
 					int i = open[k];
 					if (has != null && (i >= has.Length || !has[i])) continue;
-					if (!HasFreeBlock(i, endgame)) continue;
-					if (st[i] == null && !endgame && inFlight >= maxInFlight && (n - doneCount) > maxInFlight) continue;
+					if (!HasFreeBlock(i, endgame, uniqueOnly, haveP, haveB)) continue;
+					if (st[i] == null && !FinishingNoLock() && inFlight >= maxInFlight && (n - doneCount) > maxInFlight) continue;
 					if (sequential) return i;
 					int score = (st[i] != null) ? avail[i] - 100000 : avail[i];
 					if (score < bestScore) { bestScore = score; best = i; }
@@ -4734,11 +4968,16 @@ namespace PowerTorrent {
 			}
 
 			public bool TryClaim(BitArray has, bool sequential, bool endgame, out int piece, out int begin, out int length) {
+				return TryClaim(has, sequential, endgame, false, null, null, out piece, out begin, out length);
+			}
+
+			public bool TryClaim(BitArray has, bool sequential, bool endgame, bool uniqueOnly, List<int> haveP, List<int> haveB, out int piece, out int begin, out int length) {
 				piece = -1;
 				begin = 0;
 				length = 0;
 				lock (gate) {
-					int pick = Pick(has, sequential, endgame);
+					if (endgame && !uniqueOnly && RemainingUnrequested() > 0) return false;
+					int pick = Pick(has, sequential, endgame, uniqueOnly, haveP, haveB);
 					if (pick < 0) return false;
 					int bc = BlockCount(pick);
 					if (st[pick] == null) {
@@ -4748,21 +4987,23 @@ namespace PowerTorrent {
 						inFlight++;
 					}
 					for (int b = 0; b < bc; b++) {
-						if (st[pick][b] == 0) {
+						if (st[pick][b] == 0 && !PeerHolds(haveP, haveB, pick, b * BS)) {
 							st[pick][b] = 1;
-							hits[pick][b]++;
+							hits[pick][b] = 1;
 							piece = pick;
 							begin = b * BS;
 							length = BlockLen(pick, b);
 							return true;
 						}
 					}
-					if (endgame) {
+					if (endgame && !uniqueOnly) {
 						int best = -1, bestH = int.MaxValue;
 						for (int b = 0; b < bc; b++) {
-							if (st[pick][b] == 1 && hits[pick][b] < bestH) { bestH = hits[pick][b]; best = b; }
+							if (st[pick][b] != 1 || hits[pick] == null) continue;
+							if (PeerHolds(haveP, haveB, pick, b * BS)) continue;
+							if (hits[pick][b] < bestH) { bestH = hits[pick][b]; best = b; }
 						}
-						if (best >= 0 && bestH < 12) {
+						if (best >= 0 && bestH < 3) {
 							hits[pick][best]++;
 							piece = pick;
 							begin = best * BS;
@@ -4778,7 +5019,20 @@ namespace PowerTorrent {
 				lock (gate) {
 					if (piece < 0 || piece >= n || st[piece] == null) return;
 					int b = begin / BS;
-					if (b >= 0 && b < st[piece].Length && st[piece][b] == 1) st[piece][b] = 0;
+					if (b < 0 || b >= st[piece].Length || st[piece][b] != 1) return;
+					if (hits[piece] != null && hits[piece][b] > 0) hits[piece][b]--;
+					if (hits[piece] == null || hits[piece][b] <= 0) st[piece][b] = 0;
+				}
+			}
+
+			public bool BlockDone(int piece, int begin) {
+				lock (gate) {
+					if (piece < 0 || piece >= n) return true;
+					if (done[piece]) return true;
+					if (st[piece] == null) return false;
+					int b = begin / BS;
+					if (b < 0 || b >= st[piece].Length) return true;
+					return st[piece][b] == 2;
 				}
 			}
 
@@ -4996,6 +5250,7 @@ namespace PowerTorrent {
 			TcpClient tcp;
 			PeerIo io;
 			object wlock = new object();
+			object claimLock = new object();
 			bool incoming;
 			bool amChoked = true;
 			BitArray their;
@@ -5014,6 +5269,12 @@ namespace PowerTorrent {
 			DateTime lastMetaAt = DateTime.MinValue;
 			int theyHave;
 			bool theySeed;
+			long peerGot;
+			long peerGotLast;
+			DateTime peerRateAt = DateTime.UtcNow;
+			double peerBps;
+			int snubHits;
+			bool snubbed;
 			public bool IsSeed { get { return theySeed; } }
 
 			public PeerWorker(Engine eng, PeerIo ready) {
@@ -5070,7 +5331,7 @@ namespace PowerTorrent {
 					while (eng.running && !eng.paused) {
 						bool readable = false;
 						try {
-							readable = io.PollRead(50000);
+							readable = io.PollRead(VpnHub.TunnelOn ? 15000 : 50000);
 							if (!readable && io.Available > 0) readable = true;
 						} catch { break; }
 						if (!readable) {
@@ -5154,7 +5415,7 @@ namespace PowerTorrent {
 						return Handshake();
 					}
 				}
-				if (Session.Utp != null && eng.settings.EnableUtp) {
+				if (!VpnHub.TunnelOn && Session.Utp != null && eng.settings.EnableUtp) {
 					try {
 						UtpConn uc = Session.Utp.Connect(host, port, 2000);
 						if (uc != null) {
@@ -5324,6 +5585,29 @@ namespace PowerTorrent {
 				Bt.W32(msg, 13, len);
 				WriteAll(msg);
 			}
+			void SendCancel(int piece, int begin, int len) {
+				byte[] msg = new byte[17];
+				Bt.W32(msg, 0, 13);
+				msg[4] = 8;
+				Bt.W32(msg, 5, piece);
+				Bt.W32(msg, 9, begin);
+				Bt.W32(msg, 13, len);
+				WriteAll(msg);
+			}
+			public void CancelBlock(int piece, int begin) {
+				lock (claimLock) {
+					for (int i = claimsPiece.Count - 1; i >= 0; i--) {
+						if (claimsPiece[i] != piece || claimsBegin[i] != begin) continue;
+						int len = 16384;
+						try { if (eng.pieces != null) len = eng.pieces.BlockLength(piece, begin); } catch { }
+						try { SendCancel(piece, begin, len); } catch { }
+						claimsPiece.RemoveAt(i);
+						claimsBegin.RemoveAt(i);
+						claimAt.RemoveAt(i);
+						return;
+					}
+				}
+			}
 			void SendKeepAlive() {
 				WriteAll(new byte[4]);
 			}
@@ -5382,20 +5666,29 @@ namespace PowerTorrent {
 					int begin = Bt.R32(msg, 5);
 					int dlen = msg.Length - 9;
 					bool match = false;
-					for (int i = 0; i < claimsPiece.Count; i++) {
-						if (claimsPiece[i] == idx && claimsBegin[i] == begin) {
-							claimsPiece.RemoveAt(i);
-							claimsBegin.RemoveAt(i);
-							claimAt.RemoveAt(i);
-							match = true;
-							break;
+					lock (claimLock) {
+						for (int i = 0; i < claimsPiece.Count; i++) {
+							if (claimsPiece[i] == idx && claimsBegin[i] == begin) {
+								claimsPiece.RemoveAt(i);
+								claimsBegin.RemoveAt(i);
+								claimAt.RemoveAt(i);
+								match = true;
+								break;
+							}
 						}
 					}
-					if (!match) return;
 					if (eng.pieces == null) return;
 					int stored = eng.pieces.Submit(idx, begin, msg, 9, dlen);
-					if (stored == 0) eng.pieces.Unclaim(idx, begin);
-					else if (stored == 2) {
+					if (stored == 0) {
+						if (match) eng.pieces.Unclaim(idx, begin);
+						else if (eng.pieces.BlockDone(idx, begin)) eng.BroadcastCancel(idx, begin, this);
+						return;
+					}
+					peerGot += dlen;
+					snubHits = 0;
+					snubbed = false;
+					eng.BroadcastCancel(idx, begin, this);
+					if (stored == 2) {
 						eng.Log(2, "piece " + idx.ToString(CultureInfo.InvariantCulture) + " verified");
 						eng.BroadcastHave(idx);
 					}
@@ -5468,45 +5761,88 @@ namespace PowerTorrent {
 					}
 					return;
 				}
-				int claimSec = eng.pieces.IsEndgame() ? 6 : 15;
-				for (int i = claimsPiece.Count - 1; i >= 0; i--) {
-					if ((now - claimAt[i]).TotalSeconds > claimSec) {
-						eng.pieces.Unclaim(claimsPiece[i], claimsBegin[i]);
-						claimsPiece.RemoveAt(i);
-						claimsBegin.RemoveAt(i);
-						claimAt.RemoveAt(i);
+				bool endgame = eng.pieces.IsEndgame();
+				lock (claimLock) {
+					for (int i = claimsPiece.Count - 1; i >= 0; i--) {
+						if (eng.pieces.BlockDone(claimsPiece[i], claimsBegin[i])) {
+							int len = 16384;
+							try { len = eng.pieces.BlockLength(claimsPiece[i], claimsBegin[i]); } catch { }
+							try { SendCancel(claimsPiece[i], claimsBegin[i], len); } catch { }
+							claimsPiece.RemoveAt(i);
+							claimsBegin.RemoveAt(i);
+							claimAt.RemoveAt(i);
+							continue;
+						}
+						int claimSec = snubbed ? 4 : (endgame ? 6 : 15);
+						if ((now - claimAt[i]).TotalSeconds > claimSec) {
+							eng.pieces.Unclaim(claimsPiece[i], claimsBegin[i]);
+							claimsPiece.RemoveAt(i);
+							claimsBegin.RemoveAt(i);
+							claimAt.RemoveAt(i);
+							snubHits++;
+							if (snubHits >= 2) snubbed = true;
+						}
+					}
+					if (amChoked) return;
+					int want = DesiredQueue();
+					while (claimsPiece.Count < want) {
+						int p, b, l;
+						if (!eng.pieces.TryClaim(their, eng.settings.Sequential, false, true, claimsPiece, claimsBegin, out p, out b, out l)) break;
+						if (!SendClaim(p, b, l)) break;
+					}
+					if (claimsPiece.Count == 0) {
+						int p, b, l;
+						if (eng.pieces.TryClaim(their, eng.settings.Sequential, true, false, claimsPiece, claimsBegin, out p, out b, out l))
+							SendClaim(p, b, l);
 					}
 				}
-				if (amChoked) return;
-				bool endgame = eng.pieces.IsEndgame();
-				while (claimsPiece.Count < 48) {
-					int p, b, l;
-					if (!eng.pieces.TryClaim(their, eng.settings.Sequential, endgame, out p, out b, out l)) break;
-					claimsPiece.Add(p);
-					claimsBegin.Add(b);
-					claimAt.Add(DateTime.UtcNow);
-					try { SendRequest(p, b, l); }
-					catch {
-						eng.pieces.Unclaim(p, b);
-						claimsPiece.RemoveAt(claimsPiece.Count - 1);
-						claimsBegin.RemoveAt(claimsBegin.Count - 1);
-						claimAt.RemoveAt(claimAt.Count - 1);
-						break;
-					}
+			}
+			int DesiredQueue() {
+				DateTime n = DateTime.UtcNow;
+				double dt = (n - peerRateAt).TotalSeconds;
+				if (dt >= 0.4) {
+					double inst = (peerGot - peerGotLast) / Math.Max(dt, 0.001);
+					if (peerBps < 32) peerBps = inst;
+					else peerBps = peerBps * 0.5 + inst * 0.5;
+					peerGotLast = peerGot;
+					peerRateAt = n;
+				}
+				int maxQ = VpnHub.TunnelOn ? 256 : 48;
+				if (snubbed) return 2;
+				int q;
+				if (peerBps < 64) q = Math.Min(16, maxQ);
+				else q = (int)(peerBps * 3.0 / 16384.0);
+				if (q < 8) q = 8;
+				if (q > maxQ) q = maxQ;
+				return q;
+			}
+			bool SendClaim(int p, int b, int l) {
+				claimsPiece.Add(p);
+				claimsBegin.Add(b);
+				claimAt.Add(DateTime.UtcNow);
+				try { SendRequest(p, b, l); return true; }
+				catch {
+					eng.pieces.Unclaim(p, b);
+					claimsPiece.RemoveAt(claimsPiece.Count - 1);
+					claimsBegin.RemoveAt(claimsBegin.Count - 1);
+					claimAt.RemoveAt(claimAt.Count - 1);
+					return false;
 				}
 			}
 
 			void DropClaims() {
-				if (eng.pieces == null) {
+				lock (claimLock) {
+					if (eng.pieces == null) {
+						claimsPiece.Clear();
+						claimsBegin.Clear();
+						claimAt.Clear();
+						return;
+					}
+					for (int i = 0; i < claimsPiece.Count; i++) eng.pieces.Unclaim(claimsPiece[i], claimsBegin[i]);
 					claimsPiece.Clear();
 					claimsBegin.Clear();
 					claimAt.Clear();
-					return;
 				}
-				for (int i = 0; i < claimsPiece.Count; i++) eng.pieces.Unclaim(claimsPiece[i], claimsBegin[i]);
-				claimsPiece.Clear();
-				claimsBegin.Clear();
-				claimAt.Clear();
 			}
 
 			void Cleanup() {
@@ -5636,6 +5972,10 @@ namespace PowerTorrent {
 			lastDl = Interlocked.Read(ref sessionDown);
 			lastUl = Interlocked.Read(ref sessionUp);
 			lastSp = DateTime.UtcNow;
+			spdN = 0;
+			spdI = 0;
+			spdSum = 0;
+			etaSmooth = -1;
 		}
 
 		public void Pause() {
@@ -5790,13 +6130,7 @@ namespace PowerTorrent {
 				s.ProgressPercent = s.TotalSize > 0 ? (100.0 * ver / s.TotalSize) : 0;
 				s.PiecesDone = dc;
 				s.PiecesTotal = tot;
-				if (downBps > 64 && ver < s.TotalSize) {
-					int secI = (int)((s.TotalSize - ver) / downBps);
-					if (secI < 0) secI = 0;
-					s.Eta = string.Format(CultureInfo.InvariantCulture, "{0:00}:{1:00}:{2:00}", secI / 3600, (secI / 60) % 60, secI % 60);
-				} else {
-					s.Eta = "--";
-				}
+				s.Eta = "--";
 			}
 			int seedN = 0;
 			lock (peerLock) {
@@ -5822,8 +6156,40 @@ namespace PowerTorrent {
 				UpdateSpeed();
 				s.DownBytesPerSec = downBps;
 				s.UpBytesPerSec = upBps;
+				if (s.State != "Metadata" && s.State != "Hashing" && ver < s.TotalSize) {
+					s.Eta = FormatEta(s.TotalSize - ver);
+				}
 			}
 			return s;
+		}
+
+		string FormatEta(long remain) {
+			if (remain <= 0) return "00:00:00";
+			double avgWin = spdN > 0 ? spdSum / spdN : 0;
+			double avgHist = (activeSecs >= 3) ? (double)Interlocked.Read(ref sessionDown) / activeSecs : 0;
+			double rate;
+			if (avgWin > 64 && avgHist > 64) rate = 0.55 * avgWin + 0.45 * avgHist;
+			else if (avgWin > 64) rate = avgWin;
+			else if (avgHist > 64) rate = avgHist;
+			else rate = 0;
+			if (rate < 64) {
+				if (etaSmooth > 0 && avgWin > 0) return FormatEtaSec(etaSmooth);
+				return "--";
+			}
+			double sec = remain / rate;
+			if (etaSmooth < 0) etaSmooth = sec;
+			else if (sec < etaSmooth) etaSmooth = 0.55 * etaSmooth + 0.45 * sec;
+			else etaSmooth = 0.85 * etaSmooth + 0.15 * sec;
+			if (etaSmooth < 0) etaSmooth = 0;
+			if (etaSmooth > 359999) etaSmooth = 359999;
+			return FormatEtaSec(etaSmooth);
+		}
+
+		static string FormatEtaSec(double sec) {
+			int secI = (int)(sec + 0.5);
+			if (secI < 0) secI = 0;
+			if (secI > 359999) secI = 359999;
+			return string.Format(CultureInfo.InvariantCulture, "{0:00}:{1:00}:{2:00}", secI / 3600, (secI / 60) % 60, secI % 60);
 		}
 
 		public static string SelfTest() {
@@ -5969,6 +6335,15 @@ namespace PowerTorrent {
 			}
 		}
 
+		void BroadcastCancel(int piece, int begin, PeerWorker except) {
+			PeerWorker[] snap;
+			lock (peerLock) snap = peers.ToArray();
+			for (int i = 0; i < snap.Length; i++) {
+				if (snap[i] == except) continue;
+				try { snap[i].CancelBlock(piece, begin); } catch { }
+			}
+		}
+
 		bool OfferMetaSize(int size) {
 			if (size <= 0 || size > 8 * 1024 * 1024) return false;
 			lock (metaLock) {
@@ -6070,7 +6445,6 @@ namespace PowerTorrent {
 			pieces = new PieceMgr(this, meta);
 			status.Name = meta.Name;
 			Log(1, "torrent: " + meta.Name + " (" + Fmt(meta.TotalSize) + ", " + meta.PieceCount.ToString(CultureInfo.InvariantCulture) + " pieces)");
-			SaveTorrentFile();
 			PeerWorker[] snap;
 			lock (peerLock) snap = peers.ToArray();
 			for (int i = 0; i < snap.Length; i++) {
@@ -6084,51 +6458,6 @@ namespace PowerTorrent {
 			if (url.Length == 0) return;
 			if (!seenT.Add(url)) return;
 			m.Trackers.Add(url);
-		}
-
-		void SaveTorrentFile() {
-			try {
-				if (rawInfo == null || meta == null) return;
-				string path = Path.Combine(settings.SavePath, meta.Name + ".torrent");
-				MemoryStream ms = new MemoryStream();
-				ms.WriteByte((byte)'d');
-				if (meta.Trackers.Count > 0) {
-					WriteBencBytes(ms, Encoding.UTF8.GetBytes("announce"));
-					WriteBencBytes(ms, Encoding.UTF8.GetBytes(meta.Trackers[0]));
-					if (meta.Trackers.Count > 1) {
-						WriteBencBytes(ms, Encoding.UTF8.GetBytes("announce-list"));
-						ms.WriteByte((byte)'l');
-						for (int i = 0; i < meta.Trackers.Count; i++) {
-							ms.WriteByte((byte)'l');
-							WriteBencBytes(ms, Encoding.UTF8.GetBytes(meta.Trackers[i]));
-							ms.WriteByte((byte)'e');
-						}
-						ms.WriteByte((byte)'e');
-					}
-				}
-				WriteBencBytes(ms, Encoding.UTF8.GetBytes("created by"));
-				WriteBencBytes(ms, Encoding.UTF8.GetBytes("PowerTorrent/1.2"));
-				WriteBencBytes(ms, Encoding.UTF8.GetBytes("info"));
-				ms.Write(rawInfo, 0, rawInfo.Length);
-				if (meta.Webseeds.Count > 0) {
-					WriteBencBytes(ms, Encoding.UTF8.GetBytes("url-list"));
-					ms.WriteByte((byte)'l');
-					for (int i = 0; i < meta.Webseeds.Count; i++)
-						WriteBencBytes(ms, Encoding.UTF8.GetBytes(meta.Webseeds[i]));
-					ms.WriteByte((byte)'e');
-				}
-				ms.WriteByte((byte)'e');
-				File.WriteAllBytes(path, ms.ToArray());
-				Log(1, "wrote " + path);
-			} catch (Exception ex) {
-				Log(1, "could not save .torrent: " + ex.Message);
-			}
-		}
-
-		static void WriteBencBytes(MemoryStream ms, byte[] data) {
-			byte[] hdr = Encoding.ASCII.GetBytes(data.Length.ToString(CultureInfo.InvariantCulture) + ":");
-			ms.Write(hdr, 0, hdr.Length);
-			ms.Write(data, 0, data.Length);
 		}
 
 		void RememberPeer(string ep) {
@@ -6168,6 +6497,12 @@ namespace PowerTorrent {
 			else downBps = downBps * 0.35 + nd * 0.65;
 			if (upBps < 32 && nu > 0) upBps = nu;
 			else upBps = upBps * 0.35 + nu * 0.65;
+			if (spdN == 30) spdSum -= spdWin[spdI];
+			else spdN++;
+			spdWin[spdI] = nd;
+			spdSum += nd;
+			spdI = (spdI + 1) % 30;
+			if (nd > 0 || nu > 0) activeSecs += dt;
 			lastDl = dl;
 			lastUl = ul;
 			lastSp = n;
@@ -6304,7 +6639,7 @@ namespace PowerTorrent {
 						lastAnn = DateTime.UtcNow;
 						ThreadPool.QueueUserWorkItem(delegate { try { AnnounceAll(""); } catch { } });
 					}
-					Thread.Sleep(50);
+					Thread.Sleep(VpnHub.TunnelOn ? 25 : 50);
 				}
 			} catch (Exception ex) {
 				lock (statusLock) {
@@ -6321,6 +6656,7 @@ namespace PowerTorrent {
 			int limit = Session.PeerLimit(this, settings.MaxPeers);
 			int nT = Session.TorrentCount;
 			int burst = nT > 20 ? 4 : (nT > 8 ? 8 : 24);
+			if (VpnHub.TunnelOn) burst = Math.Max(burst, 16);
 			for (int k = 0; k < burst; k++) {
 				if (activePeerThreads >= limit) return;
 				lock (peerLock) {
@@ -6426,7 +6762,7 @@ namespace PowerTorrent {
 		}
 
 		void QueryUdpCore(string url, string ev, List<string> peersOut) {
-			if (VpnHub.HasConfig && !VpnHub.TunnelOn) { Log(2, "UDP blocked (VPN down)"); return; }
+			if (VpnHub.Blocked) { Log(2, "UDP blocked (VPN down)"); return; }
 			Uri uri;
 			try { uri = new Uri(url); } catch { return; }
 			if (uri.Port <= 0) { Log(2, "UDP tracker missing port: " + url); return; }
@@ -6436,7 +6772,7 @@ namespace PowerTorrent {
 			UdpClient udp = null;
 			IPEndPoint dest = new IPEndPoint(ip, uri.Port);
 			try {
-				if (VpnHub.HasConfig) vs = VpnHub.BindUdp(0);
+				if (VpnHub.TunnelOn) vs = VpnHub.BindUdp(0);
 				else {
 					udp = new UdpClient();
 					udp.Client.ReceiveTimeout = 8000;
@@ -6544,9 +6880,9 @@ namespace PowerTorrent {
 					sb.Append("&event=");
 					sb.Append(ev);
 				}
-				if (VpnHub.HasConfig && !VpnHub.TunnelOn) return;
+				if (VpnHub.Blocked) return;
 				byte[] body;
-				if (VpnHub.HasConfig) {
+				if (VpnHub.TunnelOn) {
 					int st;
 					if (!VpnHub.HttpRequest(sb.ToString(), 15000, -1, -1, out st, out body) || body == null) return;
 				} else {
@@ -6655,7 +6991,7 @@ namespace PowerTorrent {
 			Thread.Sleep(80 * (stagger % 25));
 			while (running) {
 				if (!settings.EnableDht) { Thread.Sleep(400); continue; }
-				if (VpnHub.HasConfig && !VpnHub.TunnelOn) { Thread.Sleep(400); continue; }
+				if (VpnHub.Blocked) { Thread.Sleep(400); continue; }
 				if (pieces != null && pieces.IsComplete) break;
 				if (nodes.Count == 0) {
 					tried.Clear();
@@ -6682,7 +7018,7 @@ namespace PowerTorrent {
 					UdpClient udp = null;
 					IPEndPoint dest = new IPEndPoint(ip, p);
 					try {
-						if (VpnHub.HasConfig) vs = VpnHub.BindUdp(0);
+						if (VpnHub.TunnelOn) vs = VpnHub.BindUdp(0);
 						else {
 							udp = new UdpClient();
 							udp.Client.ReceiveTimeout = 2500;
@@ -6746,7 +7082,7 @@ namespace PowerTorrent {
 					BitArray all = new BitArray(Math.Max(meta.PieceCount, 0));
 					all.SetAll(true);
 					int piece, begin, len;
-					bool endgame = pieces.RemainingBlocks() <= 96;
+					bool endgame = pieces.IsEndgame();
 					if (!pieces.TryClaim(all, settings.Sequential, endgame, out piece, out begin, out len)) {
 						Thread.Sleep(1000);
 						continue;
@@ -6801,8 +7137,8 @@ namespace PowerTorrent {
 		}
 
 		bool HttpRange(string url, long start, int n, byte[] dest, int destOff) {
-			if (VpnHub.HasConfig && !VpnHub.TunnelOn) return false;
-			if (VpnHub.HasConfig) {
+			if (VpnHub.Blocked) return false;
+			if (VpnHub.TunnelOn) {
 				int st; byte[] body;
 				if (!VpnHub.HttpRequest(url, 20000, start, start + n - 1, out st, out body) || body == null) return false;
 				if (st == 200 && start != 0) return false;
@@ -7052,9 +7388,39 @@ function Get-PtDefaultOptions {
 		SavePath	   = (Get-DefaultSavePath)
 		CloseToTray	   = '0'
 		NoticeAccepted = '0'
-		VpnRequire	   = '1'
+		VpnRequire	   = '0'
 		VpnAuto		   = '1'
 	}
+}
+
+function Get-PtUtf8NoBom {
+	New-Object System.Text.UTF8Encoding $false, $false
+}
+
+function Get-PtUtf8Bom {
+	New-Object System.Text.UTF8Encoding $true, $false
+}
+
+function Read-PtUtf8Text([string]$Path) {
+	$bytes = [System.IO.File]::ReadAllBytes($Path)
+	if ($null -eq $bytes -or $bytes.Length -eq 0) { return '' }
+	$off = 0
+	$enc = Get-PtUtf8NoBom
+	if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+		$off = 3
+	} elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+		$enc = [System.Text.Encoding]::Unicode
+		$off = 2
+	} elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+		$enc = [System.Text.Encoding]::BigEndianUnicode
+		$off = 2
+	}
+	return $enc.GetString($bytes, $off, $bytes.Length - $off)
+}
+
+function Write-PtUtf8File([string]$Path, [string[]]$Lines) {
+	$enc = Get-PtUtf8Bom
+	[System.IO.File]::WriteAllLines($Path, $Lines, $enc)
 }
 
 function Read-PtIni {
@@ -7066,8 +7432,11 @@ function Read-PtIni {
 		else { return $map }
 	}
 	try {
-		foreach ($line in @(Get-Content -LiteralPath $p -Encoding UTF8 -ErrorAction Stop)) {
+		$text = Read-PtUtf8Text $p
+		if ([string]::IsNullOrEmpty($text)) { return $map }
+		foreach ($line in @($text -split "`r?`n", -1)) {
 			$t = [string]$line
+			if ($t.Length -gt 0 -and [int]$t[0] -eq 0xFEFF) { $t = $t.Substring(1) }
 			if ($t.Trim().Length -eq 0) { continue }
 			if ($t.StartsWith(';') -or $t.StartsWith('#') -or $t.StartsWith('[')) { continue }
 			$eq = $t.IndexOf('=')
@@ -7087,7 +7456,7 @@ function Write-PtIni {
 	if (-not (Test-Path -LiteralPath $dir)) {
 		New-Item -ItemType Directory -Path $dir -Force | Out-Null
 	}
-	$keys = @('NoticeAccepted','Theme','Dht','Encrypt','Utp','Sequential','Seed','Port','MaxPeers','SavePath','CloseToTray','VpnRequire','VpnAuto')
+	$keys = @('NoticeAccepted','Theme','Dht','Encrypt','Utp','Sequential','Seed','Port','MaxPeers','SavePath','CloseToTray','VpnRequire','VpnAuto','VpnConfig')
 	$lines = New-Object System.Collections.Generic.List[string]
 	[void]$lines.Add('[PowerTorrent]')
 	$seen = @{}
@@ -7102,7 +7471,7 @@ function Write-PtIni {
 			[void]$lines.Add(('{0}={1}' -f $k, [string]$Map[$k]))
 		}
 	}
-	Set-Content -LiteralPath $p -Value $lines.ToArray() -Encoding UTF8
+	Write-PtUtf8File $p $lines.ToArray()
 }
 
 function Merge-PtIni {
@@ -7371,7 +7740,7 @@ function Show-PtNoticeGui {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
 		xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
 		Title="PowerTorrent" SizeToContent="WidthAndHeight"
-		WindowStartupLocation="CenterScreen" WindowStyle="None"
+		WindowStartupLocation="CenterScreen" WindowStyle="None" Topmost="True"
 		ResizeMode="NoResize" Background="{DynamicResource Theme.WindowBg}"
 		Foreground="{DynamicResource Theme.Text}"
 		FontFamily="Segoe UI" FontSize="13"
@@ -7497,6 +7866,7 @@ function Show-PtNoticeGui {
 		if ([string]::IsNullOrWhiteSpace($th)) { $th = 'Ice' }
 		Apply-PtTheme $w $th
 	} catch { }
+	try { $w.Topmost = $true } catch { }
 	$ok.add_Click({
 		$script:PtNoticeOk = $true
 		$script:PtNoticeRemember = ($chk.IsChecked -eq $true)
@@ -7584,19 +7954,63 @@ function Get-PtVpnConfPath {
 	Join-Path (Split-Path -Parent (Get-PowerTorrentScriptPath)) 'PowerTorrent.vpn.conf'
 }
 
-function Initialize-PtVpn {
-	if ($null -eq $script:PtVpnRequire) { $script:PtVpnRequire = $true }
-	if ($null -eq $script:PtVpnAuto) { $script:PtVpnAuto = $true }
-	$conf = Get-PtVpnConfPath
-	if (-not (Test-Path -LiteralPath $conf)) { return }
+function ConvertTo-PtVpnIniValue([string]$text) {
+	if ([string]::IsNullOrEmpty($text)) { return '' }
+	[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text))
+}
+
+function ConvertFrom-PtVpnIniValue([string]$v) {
+	if ([string]::IsNullOrWhiteSpace($v)) { return '' }
 	try {
-		$text = [System.IO.File]::ReadAllText($conf)
+		return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($v.Trim()))
+	} catch { return '' }
+}
+
+function Test-PtVpnIsSaved {
+	$cur = [string]$script:PtVpnConfigText
+	if ([string]::IsNullOrEmpty($cur)) { return $false }
+	return ($cur -eq [string]$script:PtVpnSavedText)
+}
+
+function Initialize-PtVpn {
+	if ($null -eq $script:PtVpnRequire) { $script:PtVpnRequire = $false }
+	if ($null -eq $script:PtVpnAuto) { $script:PtVpnAuto = $true }
+	if ($null -eq $script:PtVpnConfigText) { $script:PtVpnConfigText = '' }
+	if ($null -eq $script:PtVpnSavedText) { $script:PtVpnSavedText = '' }
+	$text = ''
+	$fromIni = $false
+	try {
+		$ini = Read-PtIni
+		if ($ini.ContainsKey('VpnConfig')) {
+			$decoded = ConvertFrom-PtVpnIniValue ([string]$ini['VpnConfig'])
+			if (-not [string]::IsNullOrEmpty($decoded)) {
+				$text = $decoded
+				$fromIni = $true
+			}
+		}
+	} catch { }
+	if ([string]::IsNullOrEmpty($text)) {
+		$conf = Get-PtVpnConfPath
+		if (Test-Path -LiteralPath $conf) {
+			try { $text = [System.IO.File]::ReadAllText($conf) } catch { $text = '' }
+		}
+	}
+	if ([string]::IsNullOrEmpty($text)) {
+		$script:PtVpnRequire = $false
+		try { [PowerTorrent.VpnHub]::Require = $false } catch { }
+		return
+	}
+	try {
 		$err = ''
 		$ok = [PowerTorrent.VpnHub]::LoadConfig($text, [ref]$err)
 		if (-not $ok) {
 			Write-Host ("VPN config: {0}" -f $err) -ForegroundColor Yellow
+			$script:PtVpnRequire = $false
+			try { [PowerTorrent.VpnHub]::Require = $false } catch { }
 			return
 		}
+		$script:PtVpnConfigText = $text
+		if ($fromIni) { $script:PtVpnSavedText = $text }
 		[PowerTorrent.VpnHub]::Require = [bool]$script:PtVpnRequire
 		if ([bool]$script:PtVpnAuto) {
 			Write-Host 'Connecting VPN...' -ForegroundColor DarkCyan
@@ -7605,6 +8019,9 @@ function Initialize-PtVpn {
 				Write-Host ("VPN {0}" -f [PowerTorrent.VpnHub]::Status) -ForegroundColor Green
 			} else {
 				Write-Host ("VPN failed: {0}" -f [PowerTorrent.VpnHub]::LastError) -ForegroundColor Yellow
+				if ([bool][PowerTorrent.VpnHub]::Require -and [bool][PowerTorrent.VpnHub]::HandshakeTimedOut) {
+					Write-Host 'Killswitch is currently enabled and is active because the tunnel cannot be reached.' -ForegroundColor Yellow
+				}
 			}
 		}
 	} catch {
@@ -7627,22 +8044,58 @@ function Get-PtInt {
 	return $Fallback
 }
 
-function Get-PtInboxPath {
-	Join-Path $env:TEMP 'PowerTorrent.inbox'
+function Send-PtIpc([string]$source) {
+	if ([string]::IsNullOrWhiteSpace($source)) { return $false }
+	try { return [bool][PowerTorrent.IpcHub]::Send($source.Trim()) } catch { return $false }
 }
 
-function Send-PtInbox([string]$source) {
-	if ([string]::IsNullOrWhiteSpace($source)) { return }
-	Add-Content -LiteralPath (Get-PtInboxPath) -Value $source.Trim() -Encoding UTF8
+function Read-PtIpc {
+	try { return @([PowerTorrent.IpcHub]::Drain()) } catch { return @() }
 }
 
-function Read-PtInbox {
-	$p = Get-PtInboxPath
+function Close-PtSingleInstance {
+	try { [PowerTorrent.IpcHub]::Stop() } catch { }
+	if ($script:SingleInstanceEvent) {
+		try { $script:SingleInstanceEvent.Dispose() } catch { }
+		$script:SingleInstanceEvent = $null
+	}
+}
+
+function Show-PtAlreadyRunning {
+	try {
+		$alreadyRunning = New-Object -ComObject Wscript.Shell
+		[void]$alreadyRunning.Popup('PowerTorrent is already running!', 0, 'ERROR:', 0x0)
+	} catch {
+		Write-Host 'PowerTorrent is already running!' -ForegroundColor Yellow
+	}
+}
+
+function Get-PtActiveJobsPath {
+	$d = $env:TEMP
+	if ([string]::IsNullOrWhiteSpace($d)) { $d = [System.IO.Path]::GetTempPath() }
+	Join-Path $d 'PowerTorrent_ActiveJobs.json'
+}
+
+function ConvertTo-PtJsonStr([string]$t) {
+	if ($null -eq $t) { $t = '' }
+	$t = $t.Replace('\', '\\').Replace('"', '\"')
+	$t = $t.Replace([string][char]13, '\r').Replace([string][char]10, '\n').Replace([string][char]9, '\t')
+	return '"' + $t + '"'
+}
+
+function Read-PtActiveJobs {
+	$p = Get-PtActiveJobsPath
 	if (-not (Test-Path -LiteralPath $p)) { return @() }
 	try {
-		$lines = @(Get-Content -LiteralPath $p -ErrorAction Stop)
-		Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
-		return @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+		$raw = [System.IO.File]::ReadAllText($p)
+		if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+		$o = $raw | ConvertFrom-Json
+		if ($null -eq $o) { return @() }
+		if ($o.PSObject.Properties.Name -contains 'j') {
+			if ($null -eq $o.j) { return @() }
+			return @($o.j)
+		}
+		return @($o)
 	} catch { return @() }
 }
 
@@ -7752,7 +8205,9 @@ using System;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Controls.Primitives;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
 namespace PowerTorrent {
@@ -7816,6 +8271,44 @@ namespace PowerTorrent {
 			mmi.ptMaxTrackSize.Y = mmi.ptMaxSize.Y;
 			Marshal.StructureToPtr(mmi, lParam, true);
 			return IntPtr.Zero;
+		}
+	}
+
+	public static class PopupPin {
+		const int GWLP_HWNDPARENT = -8;
+		const uint SWP_NOSIZE = 0x0001;
+		const uint SWP_NOMOVE = 0x0002;
+		const uint SWP_NOACTIVATE = 0x0010;
+
+		[DllImport("user32.dll", EntryPoint = "SetWindowLong")]
+		static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+
+		[DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
+		static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+		[DllImport("user32.dll")]
+		static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+		static IntPtr SetOwner(IntPtr hwnd, IntPtr owner) {
+			if (IntPtr.Size == 8) return SetWindowLongPtr64(hwnd, GWLP_HWNDPARENT, owner);
+			return new IntPtr(SetWindowLong32(hwnd, GWLP_HWNDPARENT, owner.ToInt32()));
+		}
+
+		public static void Attach(Popup popup, Window owner) {
+			if (popup == null || owner == null) return;
+			popup.Opened += delegate {
+				try {
+					UIElement child = popup.Child;
+					if (child == null) return;
+					HwndSource src = PresentationSource.FromVisual(child) as HwndSource;
+					if (src == null) return;
+					IntPtr hwnd = src.Handle;
+					IntPtr own = new WindowInteropHelper(owner).Handle;
+					if (hwnd == IntPtr.Zero || own == IntPtr.Zero) return;
+					SetOwner(hwnd, own);
+					SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+				} catch { }
+			};
 		}
 	}
 
@@ -8205,6 +8698,10 @@ function Show-PowerTorrentGui {
 			  </Trigger>
 			  <Trigger Property="IsPressed" Value="True">
 				<Setter TargetName="box" Property="Background" Value="{DynamicResource Theme.CaptionPress}"/>
+			  </Trigger>
+			  <Trigger Property="IsEnabled" Value="False">
+				<Setter Property="Foreground" Value="{DynamicResource Theme.Disabled}"/>
+				<Setter TargetName="box" Property="Opacity" Value="0.45"/>
 			  </Trigger>
 			</ControlTemplate.Triggers>
 		  </ControlTemplate>
@@ -8851,10 +9348,18 @@ function Show-PowerTorrentGui {
 				  <CheckBox x:Name="chkSeed" Content="Seed when done" IsChecked="True" Margin="0,0,0,8"/>
 				  <CheckBox x:Name="chkCloseToTray" Content="Close to tray" IsChecked="False" Margin="0,0,0,12"/>
 				  <Border Height="1" Background="{DynamicResource Theme.Border}" Margin="0,2,0,12"/>
-				  <TextBlock Text="VPN" FontWeight="SemiBold" Margin="0,0,0,6"/>
-				  <TextBlock x:Name="lblVpnStatus" Foreground="{DynamicResource Theme.Muted}" FontSize="11" Margin="0,0,0,8"
-							 TextWrapping="Wrap" Text="No config imported."/>
-				  <CheckBox x:Name="chkVpnRequire" Content="Killswitch" IsChecked="True" Margin="0,0,0,8"/>
+				  <DockPanel Margin="0,0,0,6">
+					<TextBlock x:Name="lblVpnConn" DockPanel.Dock="Right" VerticalAlignment="Center"
+							   Foreground="{DynamicResource Theme.Muted}" FontSize="11" Text="Disconnected"/>
+					<TextBlock Text="VPN" FontWeight="SemiBold" VerticalAlignment="Center"/>
+				  </DockPanel>
+				  <DockPanel x:Name="pnlVpnConfigured" Margin="0,0,0,8" Visibility="Collapsed">
+					<TextBlock x:Name="lblVpnSaved" DockPanel.Dock="Right" VerticalAlignment="Center"
+							   Foreground="{DynamicResource Theme.Muted}" FontSize="11" Text="not saved"/>
+					<TextBlock x:Name="lblVpnStatus" Foreground="{DynamicResource Theme.Muted}" FontSize="11"
+							   TextWrapping="Wrap" Text="configured" VerticalAlignment="Center"/>
+				  </DockPanel>
+				  <CheckBox x:Name="chkVpnRequire" Content="Killswitch" IsChecked="False" IsEnabled="False" Margin="0,0,0,8"/>
 				  <Button x:Name="btnVpnImport" Style="{StaticResource DlgBtn}" HorizontalAlignment="Stretch" Margin="0,0,0,6">
 					<StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
 					  <Path Style="{StaticResource IcoOnBtn}" Data="{StaticResource GeoFolder}"/>
@@ -9192,7 +9697,7 @@ function Show-PowerTorrentGui {
 	$ui = @{}
 	foreach ($n in @(
 			'hdrBar','imgPlanet','txtSave','txtSaveFlyout','btnBrowseDir','chkDht','chkEncrypt','chkUtp','chkSeq','chkSeed','chkCloseToTray',
-			'chkVpnRequire','btnVpnImport','btnVpnConnect','btnVpnStop','lblVpnStatus',
+			'chkVpnRequire','btnVpnImport','btnVpnConnect','btnVpnStop','lblVpnStatus','lblVpnConn','lblVpnSaved','pnlVpnConfigured',
 			'txtPort','txtPeers','cmbTheme','btnSaveOptions','btnAddFile','btnAddMagnet','btnPlayPause','icoPlayPause','txtPlayPause','btnStop','btnRemove',
 			'scrGeneral','pnlGeneral','lblName','lblSavePath','lblHash','lblComment','lblCreated','lblState','lblProgress','lblPieces','lblPeers','lblRatio','lblAvail','lblSpeed',
 			'txtLog','lstFiles','lstTrackers','btnRegister','btnRegisterTorrent',
@@ -9223,6 +9728,10 @@ function Show-PowerTorrentGui {
 	$ui.popOptions.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
 	$ui.popOptions.HorizontalOffset = -308
 	try { [PowerTorrent.WindowMaximizeFix]::Attach($window) } catch { }
+	try { [PowerTorrent.PopupPin]::Attach($ui.popOptions, $window) } catch { }
+	if ($ui.popMagnet) {
+		try { [PowerTorrent.PopupPin]::Attach($ui.popMagnet, $window) } catch { }
+	}
 
 	$wmploc = '%SystemRoot%\System32\wmploc.dll'
 	$script:PtPlanetIdle = Get-NativeIconBitmap -File $wmploc -Index 139 -Large
@@ -9250,6 +9759,7 @@ function Show-PowerTorrentGui {
 	$script:PtGeomRestore = [System.Windows.Media.Geometry]::Parse('M2.5,0.5 H9.5 V7.5 H8.5 V1.5 H2.5 Z M0.5,2.5 H7.5 V9.5 H0.5 Z')
 
 	$script:PtJobs = New-Object System.Collections.Generic.List[object]
+	$script:PtActiveJobsStamp = ''
 	$script:PtRows = New-Object 'System.Collections.ObjectModel.ObservableCollection[PowerTorrent.TorrentRow]'
 	$ui.lvTorrents.ItemsSource = $script:PtRows
 	try {
@@ -9274,7 +9784,7 @@ function Show-PowerTorrentGui {
 	$ui.chkSeed.IsChecked = -not [bool]$NoSeed
 	if ($null -eq $script:PtCloseToTray) { $script:PtCloseToTray = $false }
 	$ui.chkCloseToTray.IsChecked = [bool]$script:PtCloseToTray
-	if ($null -eq $script:PtVpnRequire) { $script:PtVpnRequire = $true }
+	if ($null -eq $script:PtVpnRequire) { $script:PtVpnRequire = $false }
 	if ($null -eq $script:PtVpnAuto) { $script:PtVpnAuto = $true }
 	if ($ui.chkVpnRequire) { $ui.chkVpnRequire.IsChecked = [bool]$script:PtVpnRequire }
 	if (-not $script:PtTheme) { $script:PtTheme = 'Ice' }
@@ -9294,14 +9804,15 @@ function Show-PowerTorrentGui {
 			[ValidateSet('OK','YesNo')]
 			[string]$Buttons = 'OK',
 			[string]$CheckLabel = '',
-			[bool]$CheckDefault = $false
+			[bool]$CheckDefault = $false,
+			[string]$Footnote = ''
 		)
 		$yesNo = ($Buttons -eq 'YesNo')
 		$dlgXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
 		xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
 		Title="$Title" SizeToContent="WidthAndHeight"
-		WindowStartupLocation="CenterOwner" WindowStyle="None"
+		WindowStartupLocation="CenterOwner" WindowStyle="None" Topmost="True"
 		ResizeMode="NoResize" Background="{DynamicResource Theme.WindowBg}"
 		Foreground="{DynamicResource Theme.Text}"
 		FontFamily="Segoe UI" FontSize="13"
@@ -9408,6 +9919,8 @@ function Show-PowerTorrentGui {
 	</Border>
 	<StackPanel Margin="18,14" Width="380">
 	  <TextBlock x:Name="lblMsg" TextWrapping="Wrap" Margin="0,0,0,16"/>
+	  <TextBlock x:Name="lblNote" TextWrapping="Wrap" Margin="0,-8,0,14" FontSize="11" FontStyle="Italic"
+				 Foreground="{DynamicResource Theme.Muted}" Visibility="Collapsed"/>
 	  <CheckBox x:Name="chkExtra" Margin="0,0,0,14" Visibility="Collapsed"/>
 	  <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
 		<Button x:Name="btnA" MinWidth="84" Height="28" Margin="0,0,8,0" IsDefault="True"/>
@@ -9424,8 +9937,14 @@ function Show-PowerTorrentGui {
 			Apply-PtTheme $w $th
 		} catch { }
 		try { $w.Owner = $window } catch { }
+		try { $w.Topmost = $true } catch { }
 		$w.FindName('lblTitle').Text = $Title
 		$w.FindName('lblMsg').Text = $Message
+		$note = $w.FindName('lblNote')
+		if ($note -and -not [string]::IsNullOrWhiteSpace($Footnote)) {
+			$note.Text = $Footnote
+			$note.Visibility = [System.Windows.Visibility]::Visible
+		}
 		$chk = $w.FindName('chkExtra')
 		$script:PtDlgChecked = $false
 		if ($chk -and -not [string]::IsNullOrWhiteSpace($CheckLabel)) {
@@ -9462,7 +9981,7 @@ function Show-PowerTorrentGui {
 			$save = [string]$ui.txtSaveFlyout.Text
 			$ui.txtSave.Text = $save
 		}
-		@{
+		$map = @{
 			Theme	   = $th
 			Dht		   = Get-PtBoolText ([bool]$ui.chkDht.IsChecked)
 			Encrypt	   = Get-PtBoolText ([bool]$ui.chkEncrypt.IsChecked)
@@ -9476,6 +9995,10 @@ function Show-PowerTorrentGui {
 			MaxPeers   = [string]$peerVal
 			SavePath   = $save
 		}
+		if (-not [string]::IsNullOrEmpty([string]$script:PtVpnConfigText)) {
+			$map['VpnConfig'] = ConvertTo-PtVpnIniValue ([string]$script:PtVpnConfigText)
+		}
+		return $map
 	}
 	function Get-PtCompareOptionMap {
 		$d = Get-PtDefaultOptions
@@ -9530,6 +10053,12 @@ function Show-PowerTorrentGui {
 	$ui.btnSaveOptions.add_Click({
 		try {
 			Merge-PtIni (Get-PtUiOptionMap)
+			$script:PtVpnSavedText = [string]$script:PtVpnConfigText
+			$legacy = Get-PtVpnConfPath
+			if (Test-Path -LiteralPath $legacy) {
+				try { Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue } catch { }
+			}
+			try { Update-PtVpnUi } catch { }
 			Update-SaveOptionsButton
 			Add-UiLog 'Options saved'
 		} catch {
@@ -9552,42 +10081,94 @@ function Show-PowerTorrentGui {
 	}
 	Update-AssocLabel
 
+	$script:PtVpnChkQuiet = $false
 	function Update-PtVpnUi {
-		$st = [string][PowerTorrent.VpnHub]::Status
-		$err = [string][PowerTorrent.VpnHub]::LastError
 		$has = [bool][PowerTorrent.VpnHub]::HasConfig
 		$up = [bool][PowerTorrent.VpnHub]::TunnelOn
-		if ($ui.lblVpnStatus) {
-			if (-not $has) {
-				$ui.lblVpnStatus.Text = 'No config imported.'
-			} elseif ($up) {
-				$proven = [string][PowerTorrent.VpnHub]::ProvenIp
-				if ($proven) {
-					$ui.lblVpnStatus.Text = ('Connected. {0}' -f $proven)
-				} else {
-					$ui.lblVpnStatus.Text = 'Connected.'
-				}
-			} elseif ($err) {
-				$ui.lblVpnStatus.Text = ('{0} - {1}' -f $st, $err)
-			} else {
-				$ui.lblVpnStatus.Text = $st
-			}
+		$err = [string][PowerTorrent.VpnHub]::LastError
+		if ($ui.lblVpnConn) {
+			$ui.lblVpnConn.Text = $(if ($up) { 'Connected' } else { 'Disconnected' })
+			if (-not $up -and $err) { $ui.lblVpnConn.ToolTip = $err }
+			else { $ui.lblVpnConn.ToolTip = $null }
+		}
+		if ($ui.pnlVpnConfigured) {
+			$ui.pnlVpnConfigured.Visibility = $(if ($has) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed })
+		}
+		if ($ui.lblVpnStatus) { $ui.lblVpnStatus.Text = $(if ($has) { 'configured' } else { '' }) }
+		if ($ui.lblVpnSaved) {
+			$ui.lblVpnSaved.Text = $(if ($has) { if (Test-PtVpnIsSaved) { 'saved' } else { 'not saved' } } else { '' })
 		}
 		if ($ui.lblFooter) {
 			if ($up) {
+				$ui.lblFooter.Text = 'VPN: ON'
 				$proven = [string][PowerTorrent.VpnHub]::ProvenIp
-				if ($proven) { $ui.lblFooter.Text = ('VPN IP: {0}' -f $proven) }
-				else { $ui.lblFooter.Text = 'VPN IP:' }
-			} elseif ($has) {
-				$ui.lblFooter.Text = ('VPN: {0}' -f $st)
-			} else { $ui.lblFooter.Text = '' }
+				$direct = [string][PowerTorrent.VpnHub]::DirectIp
+				$outTxt = $(if ($direct) { $direct } else { 'checking' })
+				$vpnTxt = $(if ($proven) { $proven } else { 'checking' })
+				$tip = "Outside IP: $outTxt`nVPN IP: $vpnTxt"
+				if ($direct -and $proven) {
+					if ($direct -eq $proven) { $tip = $tip + "`nVPN check failed" }
+					else { $tip = $tip + "`nVPN is working" }
+				}
+				$ui.lblFooter.ToolTip = $tip
+				try { $ui.lblFooter.Cursor = [System.Windows.Input.Cursors]::Help } catch { }
+			} else {
+				$ui.lblFooter.Text = 'VPN: OFF'
+				$ui.lblFooter.ToolTip = $null
+				try { $ui.lblFooter.Cursor = [System.Windows.Input.Cursors]::Arrow } catch { }
+			}
 		}
-		if ($has -and $ui.chkVpnRequire) { $ui.chkVpnRequire.IsChecked = $true }
+		if ($ui.chkVpnRequire) {
+			$ui.chkVpnRequire.IsEnabled = $has
+			if (-not $has) {
+				$script:PtVpnChkQuiet = $true
+				try {
+					if ([bool]$ui.chkVpnRequire.IsChecked) { $ui.chkVpnRequire.IsChecked = $false }
+				} finally { $script:PtVpnChkQuiet = $false }
+				$script:PtVpnRequire = $false
+				try { [PowerTorrent.VpnHub]::Require = $false } catch { }
+			}
+		}
 		if ($ui.btnVpnConnect) { $ui.btnVpnConnect.IsEnabled = $has -and -not $up }
 		if ($ui.btnVpnStop) { $ui.btnVpnStop.IsEnabled = $has }
 	}
 
+	function Show-PtKillswitchPopup {
+		param([ValidateSet('On','Off','Connect','Import')]$Why)
+		$on = [bool][PowerTorrent.VpnHub]::Require
+		$up = [bool][PowerTorrent.VpnHub]::TunnelOn
+		$msg = $null
+		switch ($Why) {
+			'On' {
+				if ($up) {
+					$msg = 'Killswitch is enabled. If the VPN drops, traffic is paused until you reconnect, or turn the killswitch off.'
+				} else {
+					$msg = 'Killswitch is enabled. Traffic is paused until you reconnect, or turn the killswitch off.'
+				}
+			}
+			'Off' {
+				$msg = 'Killswitch is off. Traffic can use the regular network if the VPN is down.'
+			}
+			'Connect' {
+				if ($on) {
+					$msg = 'Killswitch is enabled. Traffic is paused until the VPN is up, or turn the killswitch off.'
+				} else {
+					$msg = 'Killswitch is off. Traffic can use the regular network if the VPN is down.'
+				}
+			}
+			'Import' {
+				$msg = 'Killswitch is on. All torrent traffic will go through the VPN. If the VPN drops, the killswitch stops all traffic until you reconnect or turn it off.'
+			}
+		}
+		if ($msg) {
+			$note = ''
+			if ($Why -eq 'Import') { $note = 'Save options to keep this config after you close PowerTorrent.' }
+			Show-PtMessage -Message $msg -Footnote $note | Out-Null
+		}
+	}
+
 	function Start-PtVpnBackground {
+		param([switch]$FromImport)
 		if (-not [PowerTorrent.VpnHub]::HasConfig) { return }
 		try {
 			[void][PowerTorrent.VpnHub]::BeginStart()
@@ -9596,18 +10177,28 @@ function Show-PowerTorrentGui {
 			Show-PtMessage -Message ([string]$_) | Out-Null
 		}
 		Update-PtVpnUi
+		if ($FromImport) { Show-PtKillswitchPopup -Why Import }
+		else { Show-PtKillswitchPopup -Why Connect }
 	}
 
 	if ($ui.chkVpnRequire) {
 		$ui.chkVpnRequire.add_Click({
-			if ([bool][PowerTorrent.VpnHub]::HasConfig) {
-				$ui.chkVpnRequire.IsChecked = $true
-				$script:PtVpnRequire = $true
-			} else {
-				$script:PtVpnRequire = [bool]$ui.chkVpnRequire.IsChecked
+			if ($script:PtVpnChkQuiet) { return }
+			$has = [bool][PowerTorrent.VpnHub]::HasConfig
+			if (-not $has) {
+				$ui.chkVpnRequire.IsChecked = $false
+				$script:PtVpnRequire = $false
+				try { [PowerTorrent.VpnHub]::Require = $false } catch { }
+				Show-PtMessage -Message 'Import a VPN config before enabling the killswitch.' | Out-Null
+				try { Update-PtVpnUi } catch { }
+				return
 			}
-			[PowerTorrent.VpnHub]::Require = [bool]$script:PtVpnRequire
+			$want = [bool]$ui.chkVpnRequire.IsChecked
+			$script:PtVpnRequire = $want
+			[PowerTorrent.VpnHub]::Require = $want
 			try { [PowerTorrent.Session]::RebindListen() } catch { }
+			if ($want) { Show-PtKillswitchPopup -Why On }
+			else { Show-PtKillswitchPopup -Why Off }
 			try { Update-PtVpnUi } catch { }
 			try { Update-SaveOptionsButton } catch { }
 		})
@@ -9627,13 +10218,20 @@ function Show-PowerTorrentGui {
 					Update-PtVpnUi
 					return
 				}
-				[System.IO.File]::WriteAllText((Get-PtVpnConfPath), $text)
-				$script:PtVpnRequire = [bool]$ui.chkVpnRequire.IsChecked
-				[PowerTorrent.VpnHub]::Require = [bool]$script:PtVpnRequire
+				$script:PtVpnConfigText = $text
+				$script:PtVpnRequire = $true
+				if ($ui.chkVpnRequire) {
+					$script:PtVpnChkQuiet = $true
+					try {
+						$ui.chkVpnRequire.IsEnabled = $true
+						$ui.chkVpnRequire.IsChecked = $true
+					} finally { $script:PtVpnChkQuiet = $false }
+				}
+				[PowerTorrent.VpnHub]::Require = $true
 				$script:PtVpnAuto = $true
 				Add-UiLog 'VPN config imported'
 				Update-PtVpnUi
-				Start-PtVpnBackground
+				Start-PtVpnBackground -FromImport
 			} catch {
 				Show-PtMessage -Message ([string]$_) | Out-Null
 			}
@@ -9647,13 +10245,43 @@ function Show-PowerTorrentGui {
 	if ($ui.btnVpnStop) {
 		$ui.btnVpnStop.add_Click({
 			try {
+				if (-not [bool][PowerTorrent.VpnHub]::TunnelOn) { return }
 				[PowerTorrent.VpnHub]::Stop()
 				Add-UiLog 'VPN disconnected'
 				Update-PtVpnUi
+				try { Show-PtVpnWarn } catch { }
 			} catch { Show-PtMessage -Message ([string]$_) | Out-Null }
 		})
 	}
+	function Show-PtVpnWarn {
+		try {
+			if ($script:PtDlgWin -and [bool]$script:PtDlgWin.IsVisible) { return }
+			if ([bool][PowerTorrent.VpnHub]::HandshakeTimedOut -and [bool][PowerTorrent.VpnHub]::Require) {
+				[PowerTorrent.VpnHub]::HandshakeTimedOut = $false
+				Show-PtMessage -Message 'Killswitch is currently enabled and is active because the tunnel cannot be reached. Traffic is paused until you reconnect, or turn the killswitch off.' | Out-Null
+				return
+			}
+			if ([bool][PowerTorrent.VpnHub]::DroppedWhileUp) {
+				[PowerTorrent.VpnHub]::DroppedWhileUp = $false
+				if ([bool][PowerTorrent.VpnHub]::Require) {
+					Show-PtMessage -Message 'VPN disconnected. Traffic is paused until you reconnect, or turn the killswitch off.' | Out-Null
+				}
+			}
+			if ([bool][PowerTorrent.VpnHub]::ProbeFailed) {
+				[PowerTorrent.VpnHub]::ProbeFailed = $false
+				Show-PtMessage -Message 'VPN check failed. Your VPN IP matches your normal outside IP.' | Out-Null
+			}
+		} catch { }
+	}
+
+	try {
+		if ($ui.lblFooter) {
+			[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($ui.lblFooter, 200)
+			[System.Windows.Controls.ToolTipService]::SetShowDuration($ui.lblFooter, 60000)
+		}
+	} catch { }
 	try { Update-PtVpnUi } catch { }
+	try { Show-PtVpnWarn } catch { }
 
 	function Add-UiLog([string]$line) {
 		if ([string]::IsNullOrWhiteSpace($line)) { return }
@@ -9699,13 +10327,89 @@ function Show-PowerTorrentGui {
 		return $p
 	}
 
+	function Get-PtPersistMode {
+		param($Job, $Status)
+		if ($null -eq $Job) { return 'x' }
+		try {
+			if ($Job.Engine.IsPaused) { return 'p' }
+		} catch { }
+		$st = ''
+		if ($null -ne $Status) { $st = [string]$Status.State }
+		elseif ($Job.Row) { $st = [string]$Job.Row.Status }
+		if ($st -eq 'Paused') { return 'p' }
+		$running = $false
+		try { $running = [bool]$Job.Engine.IsRunning } catch { }
+		if (-not $running) { return 'x' }
+		if ($st -eq 'Seeding') { return 's' }
+		return 'r'
+	}
+
+	function Save-PtActiveJobs {
+		$items = New-Object System.Collections.Generic.List[object]
+		$n = 0
+		if ($script:PtJobs) { $n = $script:PtJobs.Count }
+		for ($i = 0; $i -lt $n; $i++) {
+			$job = $script:PtJobs[$i]
+			$src = [string]$job.Source
+			if ([string]::IsNullOrWhiteSpace($src)) { continue }
+			$save = [string]$job.SavePath
+			if ([string]::IsNullOrWhiteSpace($save)) { $save = Get-PtCurrentSavePath }
+			$mode = [string]$job.PersistMode
+			if ([string]::IsNullOrWhiteSpace($mode)) { $mode = Get-PtPersistMode $job $null }
+			$nm = ''
+			if ($job.Row) { $nm = [string]$job.Row.Name }
+			[void]$items.Add((New-Object psobject -Property @{ s = $src; p = $save; t = $mode; n = $nm }))
+		}
+		$path = Get-PtActiveJobsPath
+		if ($items.Count -eq 0) {
+			if (Test-Path -LiteralPath $path) {
+				try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch { }
+			}
+			$script:PtActiveJobsStamp = ''
+			return
+		}
+		$stampParts = New-Object System.Collections.Generic.List[string]
+		for ($i = 0; $i -lt $items.Count; $i++) {
+			[void]$stampParts.Add(($items[$i].s + "`t" + $items[$i].p + "`t" + $items[$i].t))
+		}
+		$stamp = [string]::Join("`n", $stampParts.ToArray())
+		if ($stamp -eq [string]$script:PtActiveJobsStamp) { return }
+		$sb = New-Object System.Text.StringBuilder
+		[void]$sb.Append('{"j":[')
+		for ($i = 0; $i -lt $items.Count; $i++) {
+			if ($i -gt 0) { [void]$sb.Append(',') }
+			[void]$sb.Append('{"s":')
+			[void]$sb.Append((ConvertTo-PtJsonStr ([string]$items[$i].s)))
+			[void]$sb.Append(',"p":')
+			[void]$sb.Append((ConvertTo-PtJsonStr ([string]$items[$i].p)))
+			[void]$sb.Append(',"t":')
+			[void]$sb.Append((ConvertTo-PtJsonStr ([string]$items[$i].t)))
+			[void]$sb.Append(',"n":')
+			[void]$sb.Append((ConvertTo-PtJsonStr ([string]$items[$i].n)))
+			[void]$sb.Append('}')
+		}
+		[void]$sb.Append(']}')
+		try {
+			$utf8 = New-Object System.Text.UTF8Encoding $false
+			[System.IO.File]::WriteAllText($path, $sb.ToString(), $utf8)
+			$script:PtActiveJobsStamp = $stamp
+		} catch { }
+	}
+
 	function Add-PtTorrent {
-		param([string]$Source)
+		param(
+			[string]$Source,
+			[string]$SaveDir = '',
+			[string]$WantState = 'r',
+			[string]$NameHint = '',
+			[switch]$Quiet,
+			[switch]$NoPersist
+		)
 		$src = $Source.Trim()
 		$isMag = $src.ToLowerInvariant().StartsWith('magnet:')
 		if (-not $isMag) {
 			if (-not (Test-Path -LiteralPath $src)) {
-				Show-PtMessage -Message "Torrent file not found:`n$src" | Out-Null
+				if (-not $Quiet) { Show-PtMessage -Message "Torrent file not found:`n$src" | Out-Null }
 				return
 			}
 			$src = [System.IO.Path]::GetFullPath($src)
@@ -9714,25 +10418,33 @@ function Show-PowerTorrentGui {
 		if ($script:PtJobs) { $jc = $script:PtJobs.Count }
 		$maxT = [PowerTorrent.Session]::MaxTorrents
 		if ($jc -ge $maxT) {
-			Show-PtMessage -Message ("Already have {0} torrents (session limit)." -f $maxT) | Out-Null
+			if (-not $Quiet) { Show-PtMessage -Message ("Already have {0} torrents (session limit)." -f $maxT) | Out-Null }
 			return
 		}
 		for ($ji = 0; $ji -lt $jc; $ji++) {
 			if ($script:PtJobs[$ji].Source -eq $src) { return }
 		}
+		$outDir = Get-PtCurrentSavePath
+		if (-not [string]::IsNullOrWhiteSpace($SaveDir)) { $outDir = $SaveDir }
 		$script:PtNextPort = Get-PtInt -Text $ui.txtPort.Text -Fallback $script:PtNextPort
 		$peerVal = Get-PtInt -Text $ui.txtPeers.Text -Fallback 80
 		$portVal = $script:PtNextPort
+		$mode = [string]$WantState
+		if ($mode -ne 'p' -and $mode -ne 'x' -and $mode -ne 's') { $mode = 'r' }
 		try {
-			$cfg = New-PowerTorrentSettings -Source $src -OutDir (Get-PtCurrentSavePath) -ListenPort $portVal -Peers $peerVal `
+			$doSeed = [bool]$ui.chkSeed.IsChecked
+			if ($mode -eq 's') { $doSeed = $true }
+			$cfg = New-PowerTorrentSettings -Source $src -OutDir $outDir -ListenPort $portVal -Peers $peerVal `
 				-Dht ([bool]$ui.chkDht.IsChecked) -Encrypt ([bool]$ui.chkEncrypt.IsChecked) -Utp ([bool]$ui.chkUtp.IsChecked) `
-				-Seq ([bool]$ui.chkSeq.IsChecked) -Seed ([bool]$ui.chkSeed.IsChecked) -Forced $Peer -Level $LogLevel
+				-Seq ([bool]$ui.chkSeq.IsChecked) -Seed $doSeed -Forced $Peer -Level $LogLevel
 			$eng = [PowerTorrent.Engine]::new($cfg)
 			$info = $eng.GetInfo()
 			$id = [guid]::NewGuid().ToString('N').Substring(0, 8)
 			$row = New-Object PowerTorrent.TorrentRow
 			$row.Id = $id
-			$row.Name = $(if ($info.Name) { $info.Name } else { $src })
+			$nm = $(if ($info.Name) { $info.Name } else { $src })
+			if (-not [string]::IsNullOrWhiteSpace($NameHint) -and ($nm.StartsWith('magnet-') -or $nm -eq $src)) { $nm = $NameHint }
+			$row.Name = $nm
 			$row.Hash = $info.InfoHashHex
 			$row.Apply($eng.GetStatus())
 			if ($row.Hash) {
@@ -9745,16 +10457,29 @@ function Show-PowerTorrentGui {
 				Engine = $eng
 				Row = $row
 				Source = $src
+				SavePath = $outDir
+				PersistMode = $mode
 				LogSeen = @{}
 			}
 			$script:PtJobs.Add($job)
 			$script:PtRows.Add($row)
-			$eng.Start()
+			if ($mode -eq 'x') {
+				try { $eng.Stop() } catch { }
+				try { $row.Apply($eng.GetStatus()) } catch { }
+				$row.Status = 'Stopped'
+			} elseif ($mode -eq 'p') {
+				try { $eng.Pause() } catch { }
+				try { $eng.Start() } catch { }
+			} else {
+				$eng.Start()
+			}
+			if (-not [string]::IsNullOrWhiteSpace($NameHint)) { $row.Name = $NameHint }
 			$script:PtPlanetConnected = $true
 			$ui.lvTorrents.SelectedItem = $row
-			Add-UiLog ('Added {0}' -f $row.Name)
+			if (-not $Quiet) { Add-UiLog ('Added {0}' -f $row.Name) }
+			if (-not $NoPersist) { try { Save-PtActiveJobs } catch { } }
 		} catch {
-			Show-PtMessage -Message ([string]$_) | Out-Null
+			if (-not $Quiet) { Show-PtMessage -Message ([string]$_) | Out-Null }
 		}
 	}
 
@@ -9793,10 +10518,32 @@ function Show-PowerTorrentGui {
 		if ($script:PtView) { try { $script:PtView.Refresh() } catch { } }
 	}
 
+	function Update-PtTrayTip {
+		param(
+			[double]$Down = 0,
+			[double]$Up = 0,
+			[int]$Count = 0
+		)
+		if (-not $script:PtNotify) { return }
+		$vpn = 'OFF'
+		try {
+			if ([bool][PowerTorrent.VpnHub]::TunnelOn) { $vpn = 'ON' }
+		} catch { }
+		$d = [PowerTorrent.Engine]::Fmt([long]$Down)
+		$u = [PowerTorrent.Engine]::Fmt([long]$Up)
+		$tip = "PowerTorrent`nD $d/s  U $u/s`n$Count t  VPN: $vpn"
+		if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
+		try { $script:PtNotify.Text = $tip } catch { }
+	}
+
 	function Update-UiStatus {
 		try {
-			$incoming = Read-PtInbox
+			$incoming = Read-PtIpc
 			if ($incoming) {
+				try {
+					if ($script:PtInTray) { Show-PtFromTray }
+					else { [void]$window.Activate() }
+				} catch { }
 				foreach ($line in $incoming) { Add-PtTorrent -Source $line }
 			}
 			$anyPeers = $false
@@ -9805,6 +10552,7 @@ function Show-PowerTorrentGui {
 			$sumDl = [long]0
 			$sumUl = [long]0
 			$count = $script:PtJobs.Count
+			$persistChanged = $false
 			for ($i = 0; $i -lt $count; $i++) {
 				$job = $script:PtJobs[$i]
 				try { $s = $job.Engine.GetStatus() } catch { continue }
@@ -9814,15 +10562,23 @@ function Show-PowerTorrentGui {
 				$sumDl += [long]$s.Downloaded
 				$sumUl += [long]$s.Uploaded
 				if ($job.Engine.IsRunning -and -not $job.Engine.IsPaused) { $anyPeers = $true }
+				$mode = Get-PtPersistMode $job $s
+				if ([string]$job.PersistMode -ne $mode) {
+					$job.PersistMode = $mode
+					$persistChanged = $true
+				}
 			}
+			if ($persistChanged) { try { Save-PtActiveJobs } catch { } }
 			$script:PtPlanetConnected = $anyPeers
 			$ui.lblDownTotal.Text = ('{0}/s' -f [PowerTorrent.Engine]::Fmt([long]$sumDown))
 			$ui.lblUpTotal.Text = ('{0}/s' -f [PowerTorrent.Engine]::Fmt([long]$sumUp))
+			try { Update-PtTrayTip -Down $sumDown -Up $sumUp -Count $count } catch { }
 			$ratioTxt = '--'
 			if ($sumDl -gt 0) { $ratioTxt = ('{0:0.000}' -f ($sumUl / [double]$sumDl)) }
 			elseif ($sumUl -gt 0) { $ratioTxt = [string][char]0x221E }
 			$ui.lblTotals.Text = ('Torrents: {0} / {1}    Ratio: {2}' -f $count, [PowerTorrent.Session]::MaxTorrents, $ratioTxt)
 			try { Update-PtVpnUi } catch { }
+			try { Show-PtVpnWarn } catch { }
 			Update-TransportButtons
 			$job = Get-SelectedJob
 			if ($job) {
@@ -10037,6 +10793,7 @@ function Show-PowerTorrentGui {
 		try { Update-FilterView } catch { }
 		try { Update-TransportButtons } catch { }
 		try { Update-UiStatus } catch { }
+		try { Save-PtActiveJobs } catch { }
 	}
 	function Invoke-PtStop {
 		$jobs = Get-SelectedJobs
@@ -10048,6 +10805,7 @@ function Show-PowerTorrentGui {
 		try { Update-FilterView } catch { }
 		try { Update-TransportButtons } catch { }
 		try { Update-UiStatus } catch { }
+		try { Save-PtActiveJobs } catch { }
 	}
 	function Invoke-PtRemove {
 		$jobs = Get-SelectedJobs
@@ -10068,6 +10826,7 @@ function Show-PowerTorrentGui {
 			[void]$script:PtJobs.Remove($job)
 			[void]$script:PtRows.Remove($job.Row)
 		}
+		try { Save-PtActiveJobs } catch { }
 		try { Update-TransportButtons } catch { }
 		try { Update-UiStatus } catch { }
 	}
@@ -10215,6 +10974,12 @@ function Show-PowerTorrentGui {
 		if ($ui.cmbTheme -and [bool]$ui.cmbTheme.IsDropDownOpen) { return }
 		$ui.popOptions.IsOpen = $false
 	})
+	$window.add_StateChanged({
+		if ($window.WindowState -eq [System.Windows.WindowState]::Minimized) {
+			try { $ui.popOptions.IsOpen = $false } catch { }
+			if ($ui.popMagnet) { try { $ui.popMagnet.IsOpen = $false } catch { } }
+		}
+	})
 	function Hide-PtToTray {
 		if ($script:PtInTray -or $script:PtHidingToTray) { return }
 		$script:PtHidingToTray = $true
@@ -10237,7 +11002,7 @@ function Show-PowerTorrentGui {
 	function Show-PtFromTray {
 		if ($script:PtHidingToTray) { return }
 		$script:PtInTray = $false
-		if ($script:PtNotify) { try { $script:PtNotify.Visible = $false } catch { } }
+		if ($script:PtNotify) { try { $script:PtNotify.Visible = $true } catch { } }
 		$window.ShowInTaskbar = $true
 		$window.WindowState = [System.Windows.WindowState]::Normal
 		try { [void]$window.Activate() } catch { }
@@ -10257,7 +11022,7 @@ function Show-PowerTorrentGui {
 	try {
 		$ni = New-Object System.Windows.Forms.NotifyIcon
 		$ni.Text = 'PowerTorrent'
-		$ni.Visible = $false
+		$ni.Visible = $true
 		if ($script:PtTrayIdle) { $ni.Icon = $script:PtTrayIdle }
 		else { $ni.Icon = [System.Drawing.SystemIcons]::Application }
 		$cm = New-Object System.Windows.Forms.ContextMenu
@@ -10270,6 +11035,7 @@ function Show-PowerTorrentGui {
 		$miExit.add_Click({ Exit-PtFromTray })
 		$ni.add_DoubleClick({ Show-PtFromTray })
 		$script:PtNotify = $ni
+		try { Update-PtTrayTip -Down 0 -Up 0 -Count 0 } catch { }
 	} catch {
 		$script:PtNotify = $null
 	}
@@ -10347,6 +11113,7 @@ function Show-PowerTorrentGui {
 		}
 		try { $timer.Stop() } catch { }
 		try { $planetTimer.Stop() } catch { }
+		try { Save-PtActiveJobs } catch { }
 		try { Stop-AllTorrents } catch { }
 		try { [PowerTorrent.VpnHub]::Stop() } catch { }
 		if ($script:PtNotify) {
@@ -10354,19 +11121,33 @@ function Show-PowerTorrentGui {
 			try { $script:PtNotify.Dispose() } catch { }
 			$script:PtNotify = $null
 		}
-		if ($script:PtMutex) {
-			try { [void]$script:PtMutex.ReleaseMutex() } catch { }
-			try { $script:PtMutex.Dispose() } catch { }
-		}
+		try { Close-PtSingleInstance } catch { }
 	})
 
 	try { Update-TransportButtons } catch { }
 
-	if ($AutoStart -and $InitialSource) {
-		$window.add_ContentRendered({
+	$window.add_ContentRendered({
+		$restored = 0
+		foreach ($rec in @(Read-PtActiveJobs)) {
+			$src = [string]$rec.s
+			$save = [string]$rec.p
+			$st = [string]$rec.t
+			$nm = [string]$rec.n
+			if ([string]::IsNullOrWhiteSpace($src)) { continue }
+			if ($st -ne 'p' -and $st -ne 'x' -and $st -ne 's') { $st = 'r' }
+			$before = 0
+			if ($script:PtJobs) { $before = $script:PtJobs.Count }
+			try { Add-PtTorrent -Source $src -SaveDir $save -WantState $st -NameHint $nm -Quiet -NoPersist } catch { }
+			$after = 0
+			if ($script:PtJobs) { $after = $script:PtJobs.Count }
+			if ($after -gt $before) { $restored++ }
+		}
+		if ($restored -gt 0) { Add-UiLog ('Restored {0} torrent(s)' -f $restored) }
+		try { Save-PtActiveJobs } catch { }
+		if ($AutoStart -and $InitialSource) {
 			Add-PtTorrent -Source $InitialSource
-		})
-	}
+		}
+	})
 
 	try {
 		[void]$window.ShowDialog()
@@ -10381,8 +11162,10 @@ function Show-PowerTorrentGui {
 Initialize-PowerTorrentEngine
 $script:PtTheme = 'Ice'
 $script:PtCloseToTray = $false
-$script:PtVpnRequire = $true
+$script:PtVpnRequire = $false
 $script:PtVpnAuto = $true
+$script:PtVpnConfigText = ''
+$script:PtVpnSavedText = ''
 Import-PtIniToSession
 if (-not $script:PtTheme) { $script:PtTheme = 'Ice' }
 if ($SelfTest) {
@@ -10413,11 +11196,11 @@ if ($Register) {
 	exit 0
 }
 
-Initialize-PtVpn
-
 try {
 	[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch { }
+
+Initialize-PtVpn
 
 if ($Torrent -and $Torrent.Trim().ToLowerInvariant().StartsWith('magnet:')) {
 	$Magnet = $Torrent
@@ -10456,20 +11239,27 @@ if ($useGui) {
 	$save = $SavePath
 	if ([string]::IsNullOrWhiteSpace($save)) { $save = Get-DefaultSavePath }
 	$auto = -not [string]::IsNullOrWhiteSpace($source)
-	$createdNew = $false
-	$script:PtMutex = New-Object System.Threading.Mutex($false, 'Local\PowerTorrent.Gui', [ref]$createdNew)
-	if (-not $createdNew) {
-		if ($source) { Send-PtInbox $source }
-		try { $script:PtMutex.Dispose() } catch { }
+	$AppId = 'PowerTorrent'
+	$oneInstance = $false
+	$script:SingleInstanceEvent = New-Object Threading.EventWaitHandle $true, ([Threading.EventResetMode]::ManualReset), "Global\$AppId", ([ref]$oneInstance)
+	if (-not $oneInstance) {
+		$handed = $false
+		if ($source) { $handed = Send-PtIpc $source }
+		if (-not $handed) { Show-PtAlreadyRunning }
+		try { $script:SingleInstanceEvent.Dispose() } catch { }
+		$script:SingleInstanceEvent = $null
 		exit 0
 	}
-	try { [void]$script:PtMutex.WaitOne(0) } catch { }
+	try { [PowerTorrent.IpcHub]::Start() } catch { }
 	if (-not (Confirm-PowerTorrentNotice -Gui)) {
-		try { [void]$script:PtMutex.ReleaseMutex() } catch { }
-		try { $script:PtMutex.Dispose() } catch { }
+		Close-PtSingleInstance
 		exit 1
 	}
-	Show-PowerTorrentGui -InitialSource $source -InitialSave $save -AutoStart:$auto
+	try {
+		Show-PowerTorrentGui -InitialSource $source -InitialSave $save -AutoStart:$auto
+	} finally {
+		Close-PtSingleInstance
+	}
 	exit 0
 }
 

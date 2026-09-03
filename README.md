@@ -5,7 +5,7 @@ A Powershell 5.1 BitTorrent client
 
 One script. Nothing else to install.
 
-VPN Killswitch: Import a WireGuard `.conf` or OpenVPN `.ovpn` and the download never leaves the tunnel. If the VPN drops, traffic stops.
+VPN Killswitch: Import a WireGuard `.conf` or OpenVPN `.ovpn` and the download never leaves the tunnel. If the VPN drops, traffic stops. Save options to keep the config in `PowerTorrent.ini`.
 
 Windows 10 or 11:
 
