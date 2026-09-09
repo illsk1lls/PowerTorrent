@@ -724,9 +724,16 @@ namespace PowerTorrent {
 			}
 		}
 		public static List<SearchRow> Run(string query, out string status) {
+			return Run(query, true, true, out status);
+		}
+		public static List<SearchRow> Run(string query, bool useTpb, bool useCsv, out string status) {
 			List<SearchRow> rows = new List<SearchRow>();
 			Dictionary<string, bool> seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 			status = "";
+			if (!useTpb && !useCsv) {
+				status = "none";
+				return rows;
+			}
 			if (VpnHub.Blocked) {
 				status = "blocked";
 				return rows;
@@ -740,35 +747,45 @@ namespace PowerTorrent {
 			int tpbN = 0, csvN = 0;
 			string tpbErr = null, csvErr = null;
 			int st; byte[] body;
-			if (VpnHub.Blocked) { status = "blocked"; return rows; }
-			if (!VpnHub.HttpGet(TpbUrl + enc, 20000, ua, out st, out body) || body == null)
-				tpbErr = st > 0 ? st.ToString(CultureInfo.InvariantCulture) : "failed";
-			else {
-				int before = rows.Count;
-				ParseObjects(Encoding.UTF8.GetString(body), "info_hash", "size", "The Pirate Bay", rows, seen);
-				tpbN = rows.Count - before;
+			if (useTpb) {
+				if (VpnHub.Blocked) { status = "blocked"; return rows; }
+				if (!VpnHub.HttpGet(TpbUrl + enc, 20000, ua, out st, out body) || body == null)
+					tpbErr = st > 0 ? st.ToString(CultureInfo.InvariantCulture) : "failed";
+				else {
+					int before = rows.Count;
+					ParseObjects(Encoding.UTF8.GetString(body), "info_hash", "size", "The Pirate Bay", rows, seen);
+					tpbN = rows.Count - before;
+				}
 			}
-			if (VpnHub.Blocked) {
-				if (csvErr == null) csvErr = "blocked";
-			} else if (!VpnHub.HttpGet(CsvUrl + enc, 20000, ua, out st, out body) || body == null)
-				csvErr = st > 0 ? st.ToString(CultureInfo.InvariantCulture) : "failed";
-			else {
-				List<SearchRow> csvRows = new List<SearchRow>();
-				Dictionary<string, bool> csvSeen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-				ParseObjects(Encoding.UTF8.GetString(body), "infohash", "size_bytes", "torrents-csv", csvRows, csvSeen);
-				csvN = csvRows.Count;
-				for (int ci = 0; ci < csvRows.Count; ci++) {
-					SearchRow cr = csvRows[ci];
-					AddRow(rows, seen, cr.Hash, cr.Name, cr.SizeBytes, cr.Seeds, cr.Leech, cr.Source);
+			if (useCsv) {
+				if (VpnHub.Blocked) {
+					if (csvErr == null) csvErr = "blocked";
+				} else if (!VpnHub.HttpGet(CsvUrl + enc, 20000, ua, out st, out body) || body == null)
+					csvErr = st > 0 ? st.ToString(CultureInfo.InvariantCulture) : "failed";
+				else {
+					List<SearchRow> csvRows = new List<SearchRow>();
+					Dictionary<string, bool> csvSeen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+					ParseObjects(Encoding.UTF8.GetString(body), "infohash", "size_bytes", "torrents-csv", csvRows, csvSeen);
+					csvN = csvRows.Count;
+					for (int ci = 0; ci < csvRows.Count; ci++) {
+						SearchRow cr = csvRows[ci];
+						AddRow(rows, seen, cr.Hash, cr.Name, cr.SizeBytes, cr.Seeds, cr.Leech, cr.Source);
+					}
 				}
 			}
 			rows.Sort(delegate(SearchRow x, SearchRow y) { return y.Seeds.CompareTo(x.Seeds); });
 			StringBuilder sb = new StringBuilder();
-			sb.Append("The Pirate Bay: ").Append(tpbN.ToString(CultureInfo.InvariantCulture));
-			if (tpbErr != null) sb.Append(" (").Append(tpbErr).Append(")");
-			sb.Append("    torrents-csv: ").Append(csvN.ToString(CultureInfo.InvariantCulture));
-			if (csvErr != null) sb.Append(" (").Append(csvErr).Append(")");
-			sb.Append("    ").Append(rows.Count.ToString(CultureInfo.InvariantCulture)).Append(" results");
+			if (useTpb) {
+				sb.Append("The Pirate Bay: ").Append(tpbN.ToString(CultureInfo.InvariantCulture));
+				if (tpbErr != null) sb.Append(" (").Append(tpbErr).Append(")");
+			}
+			if (useCsv) {
+				if (sb.Length > 0) sb.Append("    ");
+				sb.Append("Torrents-CSV: ").Append(csvN.ToString(CultureInfo.InvariantCulture));
+				if (csvErr != null) sb.Append(" (").Append(csvErr).Append(")");
+			}
+			if (sb.Length > 0) sb.Append("    ");
+			sb.Append(rows.Count.ToString(CultureInfo.InvariantCulture)).Append(" results");
 			status = sb.ToString();
 			return rows;
 		}
@@ -787,6 +804,9 @@ namespace PowerTorrent {
 		static string readyStatus;
 		public static bool IsBusy { get { return busy; } }
 		public static bool Start(string query) {
+			return Start(query, true, true);
+		}
+		public static bool Start(string query, bool useTpb, bool useCsv) {
 			lock (gate) {
 				if (busy) return false;
 				busy = true;
@@ -796,7 +816,7 @@ namespace PowerTorrent {
 			Thread t = new Thread(delegate() {
 				string st;
 				List<SearchRow> r;
-				try { r = TorrentSearch.Run(query, out st); }
+				try { r = TorrentSearch.Run(query, useTpb, useCsv, out st); }
 				catch (Exception ex) {
 					st = ex.Message;
 					r = new List<SearchRow>();
@@ -7906,10 +7926,15 @@ function Get-PtDefaultOptions {
 		Utp			   = '1'
 		Sequential	   = '0'
 		Seed		   = '1'
+		FinishAction   = 'seed'
 		Port		   = '6881'
 		MaxPeers	   = '80'
 		SavePath	   = (Get-DefaultSavePath)
+		OpenToTray	   = '0'
 		CloseToTray	   = '0'
+		ExitWhenIdle   = '0'
+		SearchTpb	   = '0'
+		SearchCsv	   = '0'
 		NoticeAccepted = '0'
 		VpnRequire	   = '0'
 		VpnAuto		   = '1'
@@ -7975,7 +8000,7 @@ function Write-PtIni {
 	if (-not (Test-Path -LiteralPath $dir)) {
 		New-Item -ItemType Directory -Path $dir -Force | Out-Null
 	}
-	$keys = @('NoticeAccepted','Theme','Dht','Encrypt','Utp','Sequential','Seed','Port','MaxPeers','SavePath','CloseToTray','VpnRequire','VpnAuto','VpnConfig')
+	$keys = @('NoticeAccepted','Theme','Dht','Encrypt','Utp','Sequential','Seed','FinishAction','Port','MaxPeers','SavePath','OpenToTray','CloseToTray','ExitWhenIdle','SearchTpb','SearchCsv','VpnRequire','VpnAuto','VpnConfig')
 	$lines = New-Object System.Collections.Generic.List[string]
 	[void]$lines.Add('[PowerTorrent]')
 	$seen = @{}
@@ -8008,6 +8033,32 @@ function Test-PtIniFlag([string]$v) {
 		'yes' { return $true }
 		'on' { return $true }
 		default { return $false }
+	}
+}
+
+function Normalize-PtFinishAction([string]$v) {
+	if ([string]::IsNullOrWhiteSpace($v)) { return 'seed' }
+	switch ($v.Trim().ToLowerInvariant()) {
+		'stop' { return 'stop' }
+		'remove' { return 'remove' }
+		'seed' { return 'seed' }
+		default { return 'seed' }
+	}
+}
+
+function Get-PtFinishActionLabel([string]$code) {
+	switch (Normalize-PtFinishAction $code) {
+		'stop' { return 'Stop when done' }
+		'remove' { return 'Remove when done' }
+		default { return 'Seed when done' }
+	}
+}
+
+function Get-PtFinishActionCode([string]$label) {
+	switch ([string]$label) {
+		'Stop when done' { return 'stop' }
+		'Remove when done' { return 'remove' }
+		default { return 'seed' }
 	}
 }
 
@@ -8464,7 +8515,17 @@ function Import-PtIniToSession {
 		$script:NoSeed = [switch](-not (Test-PtIniFlag $ini['Seed']))
 	}
 	if ($ini.ContainsKey('Theme') -and $ini['Theme']) { $script:PtTheme = $ini['Theme'] }
+	$script:PtFinishAction = 'seed'
+	if ($ini.ContainsKey('FinishAction') -and -not [string]::IsNullOrWhiteSpace([string]$ini['FinishAction'])) {
+		$script:PtFinishAction = Normalize-PtFinishAction ([string]$ini['FinishAction'])
+	} elseif ($ini.ContainsKey('Seed') -and -not (Test-PtIniFlag $ini['Seed'])) {
+		$script:PtFinishAction = 'stop'
+	}
+	if ($ini.ContainsKey('OpenToTray')) { $script:PtOpenToTray = Test-PtIniFlag $ini['OpenToTray'] }
 	if ($ini.ContainsKey('CloseToTray')) { $script:PtCloseToTray = Test-PtIniFlag $ini['CloseToTray'] }
+	if ($ini.ContainsKey('ExitWhenIdle')) { $script:PtExitWhenIdle = Test-PtIniFlag $ini['ExitWhenIdle'] }
+	if ($ini.ContainsKey('SearchTpb')) { $script:PtSearchTpb = Test-PtIniFlag $ini['SearchTpb'] }
+	if ($ini.ContainsKey('SearchCsv')) { $script:PtSearchCsv = Test-PtIniFlag $ini['SearchCsv'] }
 	if ($ini.ContainsKey('VpnRequire')) { $script:PtVpnRequire = Test-PtIniFlag $ini['VpnRequire'] }
 	if ($ini.ContainsKey('VpnAuto')) { $script:PtVpnAuto = Test-PtIniFlag $ini['VpnAuto'] }
 }
@@ -8967,6 +9028,7 @@ function Show-PowerTorrentGui {
 	<StreamGeometry x:Key="GeoChevronRight">M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoGear">M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoFolder">M10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6H12L10,4Z</StreamGeometry>
+	<StreamGeometry x:Key="GeoCopy">M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoSearch">M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L20.13,19.42L18.72,20.83L13.03,15.14C11.89,16.11 10.41,16.7 8.8,16.7C5.24,16.7 2.3,13.76 2.3,10.2C2.3,6.64 5.24,3.7 8.8,3.7M9.5,5A4.5,4.5 0 0,0 5,9.5A4.5,4.5 0 0,0 9.5,14A4.5,4.5 0 0,0 14,9.5A4.5,4.5 0 0,0 9.5,5Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoHelpCircle">M11,18H13V16H11V18M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,6A4,4 0 0,0 8,10H10A2,2 0 0,1 12,8A2,2 0 0,1 14,10C14,12 11,11.75 11,15H13C13,12.75 16,12.5 16,10A4,4 0 0,0 12,6Z</StreamGeometry>
 	<SolidColorBrush x:Key="Theme.WindowBg" Color="#141A1E"/>
@@ -9880,7 +9942,7 @@ function Show-PowerTorrentGui {
 			  <Button x:Name="btnTabTransfers" Style="{StaticResource ViewTabBtn}" Tag="1" Content="Transfers" ToolTip="Transfers"/>
 			  <Border Width="1" Background="{DynamicResource Theme.Border}" Margin="0,5"/>
 			  <Button x:Name="btnTabSearch" Style="{StaticResource ViewTabBtn}" Tag="0" Content="Search"
-					  ToolTip="Search The Pirate Bay and torrents-csv"/>
+					  ToolTip="Search APIs enabled under Options > Search API"/>
 			</StackPanel>
 		  </Border>
 		  <Button x:Name="btnOptions" Style="{StaticResource DlgBtn}" Width="32" Padding="0" ToolTip="Options">
@@ -9915,8 +9977,24 @@ function Show-PowerTorrentGui {
 				  <CheckBox x:Name="chkEncrypt" Content="MSE encryption" IsChecked="True" Margin="0,0,0,8"/>
 				  <CheckBox x:Name="chkUtp" Content="uTP" IsChecked="True" Margin="0,0,0,8"/>
 				  <CheckBox x:Name="chkSeq" Content="Sequential download" Margin="0,0,0,8"/>
-				  <CheckBox x:Name="chkSeed" Content="Seed when done" IsChecked="True" Margin="0,0,0,8"/>
-				  <CheckBox x:Name="chkCloseToTray" Content="Close to tray" IsChecked="False" Margin="0,0,0,12"/>
+				  <CheckBox x:Name="chkOpenToTray" Content="Open to tray" IsChecked="False" Margin="0,0,0,8"
+							ToolTip="Start in the notification area instead of showing the window."/>
+				  <CheckBox x:Name="chkCloseToTray" Content="Close to tray" IsChecked="False" Margin="0,0,0,8"
+							ToolTip="The close button hides PowerTorrent in the notification area."/>
+				  <DockPanel Margin="0,0,0,8">
+					<TextBlock Text="Finish action" Width="90" VerticalAlignment="Center"
+							   ToolTip="What to do when a download reaches 100%."/>
+					<ComboBox x:Name="cmbFinishAction"
+							  ToolTip="Seed when done keeps sharing. Stop when done leaves the torrent in the list. Remove when done takes it off the list."/>
+				  </DockPanel>
+				  <CheckBox x:Name="chkExitWhenIdle" Content="Quit when all jobs finish" IsChecked="False" Margin="0,0,0,12"
+							ToolTip="When the transfer list is empty after a download finishes, exit. Pair with Finish action: Remove when done."/>
+				  <Border Height="1" Background="{DynamicResource Theme.Border}" Margin="0,2,0,12"/>
+				  <TextBlock Text="Search API" FontWeight="SemiBold" Margin="0,0,0,8"/>
+				  <CheckBox x:Name="chkSearchTpb" Content="The Pirate Bay" IsChecked="False" Margin="0,0,0,8"
+							ToolTip="Search apibay.org. Off until you enable it."/>
+				  <CheckBox x:Name="chkSearchCsv" Content="Torrents-CSV" IsChecked="False" Margin="0,0,0,12"
+							ToolTip="Search torrents-csv.com. Off until you enable it."/>
 				  <Border Height="1" Background="{DynamicResource Theme.Border}" Margin="0,2,0,12"/>
 				  <DockPanel Margin="0,0,0,6">
 					<TextBlock x:Name="lblVpnConn" DockPanel.Dock="Right" VerticalAlignment="Center"
@@ -9957,6 +10035,8 @@ function Show-PowerTorrentGui {
 					  <TextBlock Text="Connect" VerticalAlignment="Center"/>
 					</Button>
 				  </DockPanel>
+				  <Border Height="1" Background="{DynamicResource Theme.Border}" Margin="0,2,0,12"/>
+				  <TextBlock Text="Connections" FontWeight="SemiBold" Margin="0,0,0,8"/>
 				  <DockPanel Margin="0,0,0,8">
 					<TextBlock Text="Port" Width="80" VerticalAlignment="Center"/>
 					<TextBox x:Name="txtPort" Height="24" Text="6881" VerticalContentAlignment="Center" Padding="4,1"/>
@@ -10098,6 +10178,22 @@ function Show-PowerTorrentGui {
 				</MenuItem.Icon>
 			  </MenuItem>
 			  <Separator x:Name="miCtxSep"/>
+			  <MenuItem x:Name="miCtxOpenFolder" Header="Open folder">
+				<MenuItem.Icon>
+				  <Path Style="{StaticResource IcoFilter}" Width="14" Height="14" Data="{StaticResource GeoFolder}"/>
+				</MenuItem.Icon>
+			  </MenuItem>
+			  <MenuItem x:Name="miCtxCopyMagnet" Header="Copy magnet link">
+				<MenuItem.Icon>
+				  <Path Style="{StaticResource IcoFilter}" Width="14" Height="14" Data="{StaticResource GeoMagnet}"/>
+				</MenuItem.Icon>
+			  </MenuItem>
+			  <MenuItem x:Name="miCtxCopyHash" Header="Copy info hash">
+				<MenuItem.Icon>
+				  <Path Style="{StaticResource IcoFilter}" Width="14" Height="14" Data="{StaticResource GeoCopy}"/>
+				</MenuItem.Icon>
+			  </MenuItem>
+			  <Separator x:Name="miCtxSep2"/>
 			  <MenuItem x:Name="miCtxRemove" Header="Remove">
 				<MenuItem.Icon>
 				  <Path Style="{StaticResource IcoFilter}" Width="14" Height="14" Data="{StaticResource GeoMinus}"/>
@@ -10280,7 +10376,7 @@ function Show-PowerTorrentGui {
 		<Border DockPanel.Dock="Top" Padding="10,8" Background="{DynamicResource ToolFace}">
 		  <DockPanel>
 			<Button x:Name="btnSearchGo" Style="{StaticResource DlgBtn}" DockPanel.Dock="Right" Margin="6,0,0,0" MinWidth="80"
-					ToolTip="Search The Pirate Bay and torrents-csv">
+					ToolTip="Search APIs enabled under Options > Search API">
 			  <StackPanel Orientation="Horizontal">
 				<Path Style="{StaticResource IcoOnBtn}" Data="{StaticResource GeoSearch}"/>
 				<TextBlock Text="Search" VerticalAlignment="Center"/>
@@ -10291,11 +10387,12 @@ function Show-PowerTorrentGui {
 			  <TextBlock Text="Download" VerticalAlignment="Center"/>
 			</Button>
 			<TextBox x:Name="txtSearch" Height="26" VerticalContentAlignment="Center"
-					 ToolTip="Search The Pirate Bay and torrents-csv"/>
+					 ToolTip="Search the APIs enabled under Options > Search API"/>
 		  </DockPanel>
 		</Border>
 		<TextBlock x:Name="lblSearchStatus" DockPanel.Dock="Bottom" Margin="10,6" Foreground="{DynamicResource Theme.Muted}"
-				   FontSize="11" Text="The Pirate Bay and torrents-csv. Search uses the VPN when it is connected."/>
+				   FontSize="11" TextWrapping="Wrap"
+				   Text="No search APIs are enabled. Go to Options &gt; Search API to enable one or more."/>
 		<ListView x:Name="lvSearch" Style="{StaticResource PtListView}" Background="{DynamicResource Theme.WindowBg}"
 				  Foreground="{DynamicResource Theme.Text}" BorderThickness="0" SelectionMode="Single">
 		  <ListView.View>
@@ -10319,7 +10416,7 @@ function Show-PowerTorrentGui {
 
 	$ui = @{}
 	foreach ($n in @(
-			'hdrBar','imgPlanet','txtSaveFlyout','btnBrowseDir','chkDht','chkEncrypt','chkUtp','chkSeq','chkSeed','chkCloseToTray',
+			'hdrBar','imgPlanet','txtSaveFlyout','btnBrowseDir','chkDht','chkEncrypt','chkUtp','chkSeq','chkOpenToTray','chkCloseToTray','cmbFinishAction','chkExitWhenIdle','chkSearchTpb','chkSearchCsv',
 			'chkVpnRequire','lnkAirVpn','btnAirVpnHelp','btnVpnImport','btnVpnConnect','btnVpnStop','lblVpnStatus','lblVpnConn','lblVpnSaved','pnlVpnConfigured',
 			'txtPort','txtPeers','cmbTheme','btnSaveOptions','btnAddFile','btnAddMagnet','btnPlayPause','icoPlayPause','txtPlayPause','btnStop','btnRemove',
 			'scrGeneral','pnlGeneral','lblName','lblSavePath','lblHash','lblComment','lblCreated','lblState','lblProgress','lblPieces','lblPeers','lblRatio','lblAvail','lblSpeed',
@@ -10327,7 +10424,7 @@ function Show-PowerTorrentGui {
 			'btnUnregister','btnResetOptions','lblAssoc','lblFooter','lblTotals','lblDownTotal','lblUpTotal',
 			'btnWinMin','btnWinMax','btnWinClose','pathWinMax','pathWinClose','btnOptions','popOptions',
 			'lvTorrents','lstFilter','colFilter','btnFilterFold','icoFilterFold','popMagnet','txtMagnet','btnMagnetOk','btnMagnetCancel',
-			'ctxTorrents','miCtxPlayPause','icoCtxPlayPause','miCtxStop','miCtxRemove','miCtxSep',
+			'ctxTorrents','miCtxPlayPause','icoCtxPlayPause','miCtxStop','miCtxRemove','miCtxSep','miCtxSep2','miCtxOpenFolder','miCtxCopyMagnet','miCtxCopyHash',
 			'btnTabTransfers','btnTabSearch','grdTransfers','pnlSearch',
 			'txtSearch','btnSearchGo','btnSearchDownload','lvSearch','lblSearchStatus'
 		)) {
@@ -10384,6 +10481,8 @@ function Show-PowerTorrentGui {
 	$script:PtGeomRestore = [System.Windows.Media.Geometry]::Parse('M2.5,0.5 H9.5 V7.5 H8.5 V1.5 H2.5 Z M0.5,2.5 H7.5 V9.5 H0.5 Z')
 
 	$script:PtJobs = New-Object System.Collections.Generic.List[object]
+	$script:PtHadWork = $false
+	$script:PtIdleMayExit = $false
 	$script:PtActiveJobsStamp = ''
 	$script:PtRows = New-Object 'System.Collections.ObjectModel.ObservableCollection[PowerTorrent.TorrentRow]'
 	$ui.lvTorrents.ItemsSource = $script:PtRows
@@ -10416,9 +10515,28 @@ function Show-PowerTorrentGui {
 	$ui.chkEncrypt.IsChecked = -not [bool]$NoEncrypt
 	$ui.chkUtp.IsChecked = -not [bool]$NoUtp
 	$ui.chkSeq.IsChecked = [bool]$Sequential
-	$ui.chkSeed.IsChecked = -not [bool]$NoSeed
+	if ($null -eq $script:PtOpenToTray) { $script:PtOpenToTray = $false }
 	if ($null -eq $script:PtCloseToTray) { $script:PtCloseToTray = $false }
+	if ($null -eq $script:PtExitWhenIdle) { $script:PtExitWhenIdle = $false }
+	if ([string]::IsNullOrWhiteSpace([string]$script:PtFinishAction)) {
+		if ([bool]$NoSeed) { $script:PtFinishAction = 'stop' } else { $script:PtFinishAction = 'seed' }
+	} else {
+		$script:PtFinishAction = Normalize-PtFinishAction ([string]$script:PtFinishAction)
+	}
+	if ($ui.chkOpenToTray) { $ui.chkOpenToTray.IsChecked = [bool]$script:PtOpenToTray }
 	$ui.chkCloseToTray.IsChecked = [bool]$script:PtCloseToTray
+	if ($ui.chkExitWhenIdle) { $ui.chkExitWhenIdle.IsChecked = [bool]$script:PtExitWhenIdle }
+	if ($null -eq $script:PtSearchTpb) { $script:PtSearchTpb = $false }
+	if ($null -eq $script:PtSearchCsv) { $script:PtSearchCsv = $false }
+	if ($ui.chkSearchTpb) { $ui.chkSearchTpb.IsChecked = [bool]$script:PtSearchTpb }
+	if ($ui.chkSearchCsv) { $ui.chkSearchCsv.IsChecked = [bool]$script:PtSearchCsv }
+	if ($ui.cmbFinishAction) {
+		foreach ($fa in @('Seed when done','Stop when done','Remove when done')) {
+			[void]$ui.cmbFinishAction.Items.Add($fa)
+		}
+		$faPick = Get-PtFinishActionLabel ([string]$script:PtFinishAction)
+		$ui.cmbFinishAction.SelectedItem = $faPick
+	}
 	if ($null -eq $script:PtVpnRequire) { $script:PtVpnRequire = $false }
 	if ($null -eq $script:PtVpnAuto) { $script:PtVpnAuto = $true }
 	if ($ui.chkVpnRequire) { $ui.chkVpnRequire.IsChecked = [bool]$script:PtVpnRequire }
@@ -10608,6 +10726,13 @@ function Show-PowerTorrentGui {
 		return $script:PtDlgResult
 	}
 
+	function Get-PtUiFinishAction {
+		if ($ui.cmbFinishAction -and $null -ne $ui.cmbFinishAction.SelectedItem) {
+			return Get-PtFinishActionCode ([string]$ui.cmbFinishAction.SelectedItem)
+		}
+		return Normalize-PtFinishAction ([string]$script:PtFinishAction)
+	}
+
 	function Get-PtUiOptionMap {
 		$portVal = Get-PtInt -Text $ui.txtPort.Text -Fallback 6881
 		$peerVal = Get-PtInt -Text $ui.txtPeers.Text -Fallback 80
@@ -10620,8 +10745,13 @@ function Show-PowerTorrentGui {
 			Encrypt	   = Get-PtBoolText ([bool]$ui.chkEncrypt.IsChecked)
 			Utp		   = Get-PtBoolText ([bool]$ui.chkUtp.IsChecked)
 			Sequential = Get-PtBoolText ([bool]$ui.chkSeq.IsChecked)
-			Seed	   = Get-PtBoolText ([bool]$ui.chkSeed.IsChecked)
-			CloseToTray = Get-PtBoolText ([bool]$ui.chkCloseToTray.IsChecked)
+			Seed	   = Get-PtBoolText ((Get-PtUiFinishAction) -eq 'seed')
+			FinishAction = Get-PtUiFinishAction
+			OpenToTray = Get-PtBoolText ($ui.chkOpenToTray -and [bool]$ui.chkOpenToTray.IsChecked)
+			CloseToTray = Get-PtBoolText ($ui.chkCloseToTray -and [bool]$ui.chkCloseToTray.IsChecked)
+			ExitWhenIdle = Get-PtBoolText ($ui.chkExitWhenIdle -and [bool]$ui.chkExitWhenIdle.IsChecked)
+			SearchTpb = Get-PtBoolText ($ui.chkSearchTpb -and [bool]$ui.chkSearchTpb.IsChecked)
+			SearchCsv = Get-PtBoolText ($ui.chkSearchCsv -and [bool]$ui.chkSearchCsv.IsChecked)
 			VpnRequire = Get-PtBoolText ([bool]$ui.chkVpnRequire.IsChecked)
 			VpnAuto	   = Get-PtBoolText ([bool]$script:PtVpnAuto)
 			Port	   = [string]$portVal
@@ -10636,7 +10766,7 @@ function Show-PowerTorrentGui {
 	function Get-PtCompareOptionMap {
 		$d = Get-PtDefaultOptions
 		$ini = Read-PtIni
-		foreach ($k in @('Theme','Dht','Encrypt','Utp','Sequential','Seed','Port','MaxPeers','SavePath','CloseToTray','VpnRequire','VpnAuto')) {
+		foreach ($k in @('Theme','Dht','Encrypt','Utp','Sequential','Seed','FinishAction','Port','MaxPeers','SavePath','OpenToTray','CloseToTray','ExitWhenIdle','SearchTpb','SearchCsv','VpnRequire','VpnAuto')) {
 			if ($ini.ContainsKey($k) -and $null -ne $ini[$k] -and [string]$ini[$k] -ne '') { $d[$k] = [string]$ini[$k] }
 		}
 		return $d
@@ -10651,6 +10781,13 @@ function Show-PowerTorrentGui {
 		try {
 			$portVal = Get-PtInt -Text $ui.txtPort.Text -Fallback 6881
 			$peerVal = Get-PtInt -Text $ui.txtPeers.Text -Fallback 80
+			$script:PtOpenToTray = [bool]$ui.chkOpenToTray.IsChecked
+			$script:PtCloseToTray = [bool]$ui.chkCloseToTray.IsChecked
+			$script:PtExitWhenIdle = [bool]$ui.chkExitWhenIdle.IsChecked
+			$script:PtSearchTpb = ($ui.chkSearchTpb -and [bool]$ui.chkSearchTpb.IsChecked)
+			$script:PtSearchCsv = ($ui.chkSearchCsv -and [bool]$ui.chkSearchCsv.IsChecked)
+			$script:PtFinishAction = Get-PtUiFinishAction
+			$wantSeed = ($script:PtFinishAction -eq 'seed')
 			$n = 0
 			if ($script:PtJobs) { $n = $script:PtJobs.Count }
 			for ($i = 0; $i -lt $n; $i++) {
@@ -10660,17 +10797,20 @@ function Show-PowerTorrentGui {
 				$cfg.EnableEncrypt = [bool]$ui.chkEncrypt.IsChecked
 				$cfg.EnableUtp = [bool]$ui.chkUtp.IsChecked
 				$cfg.Sequential = [bool]$ui.chkSeq.IsChecked
-				$cfg.SeedAfterComplete = [bool]$ui.chkSeed.IsChecked
+				$cfg.SeedAfterComplete = $wantSeed
 				$cfg.MaxPeers = $peerVal
-				$script:PtCloseToTray = [bool]$ui.chkCloseToTray.IsChecked
 				try { $job.Engine.ApplyLiveSettings() } catch { }
 			}
+			try { Update-PtSearchIdleStatus } catch { }
 			try { Update-SaveOptionsButton } catch { }
 		} catch { }
 	}
 	$optSync = { try { Sync-LiveOptions } catch { } }
-	foreach ($c in @($ui.chkDht, $ui.chkEncrypt, $ui.chkUtp, $ui.chkSeq, $ui.chkSeed, $ui.chkCloseToTray)) {
-		$c.add_Click($optSync)
+	foreach ($c in @($ui.chkDht, $ui.chkEncrypt, $ui.chkUtp, $ui.chkSeq, $ui.chkOpenToTray, $ui.chkCloseToTray, $ui.chkExitWhenIdle, $ui.chkSearchTpb, $ui.chkSearchCsv)) {
+		if ($c) { $c.add_Click($optSync) }
+	}
+	if ($ui.cmbFinishAction) {
+		$ui.cmbFinishAction.add_SelectionChanged($optSync)
 	}
 	$ui.txtPort.add_LostFocus($optSync)
 	$ui.txtPeers.add_LostFocus($optSync)
@@ -10694,8 +10834,11 @@ function Show-PowerTorrentGui {
 			Show-PtMessage -Message ([string]$_) | Out-Null
 		}
 	})
-	foreach ($c in @($ui.chkDht, $ui.chkEncrypt, $ui.chkUtp, $ui.chkSeq, $ui.chkSeed, $ui.chkCloseToTray)) {
-		$c.add_Click({ try { Update-SaveOptionsButton } catch { } })
+	foreach ($c in @($ui.chkDht, $ui.chkEncrypt, $ui.chkUtp, $ui.chkSeq, $ui.chkOpenToTray, $ui.chkCloseToTray, $ui.chkExitWhenIdle, $ui.chkSearchTpb, $ui.chkSearchCsv)) {
+		if ($c) { $c.add_Click({ try { Update-SaveOptionsButton } catch { } }) }
+	}
+	if ($ui.cmbFinishAction) {
+		$ui.cmbFinishAction.add_SelectionChanged({ try { Update-SaveOptionsButton } catch { } })
 	}
 	$ui.txtPort.add_LostFocus({ try { Update-SaveOptionsButton } catch { } })
 	$ui.txtPeers.add_LostFocus({ try { Update-SaveOptionsButton } catch { } })
@@ -10711,6 +10854,60 @@ function Show-PowerTorrentGui {
 	Update-AssocLabel
 
 	$script:PtVpnChkQuiet = $false
+	function Test-PtSearchApiOn([string]$which) {
+		if ($which -eq 'tpb') { return ($ui.chkSearchTpb -and [bool]$ui.chkSearchTpb.IsChecked) }
+		if ($which -eq 'csv') { return ($ui.chkSearchCsv -and [bool]$ui.chkSearchCsv.IsChecked) }
+		return $false
+	}
+
+	function Get-PtSearchIdleText {
+		$tpb = Test-PtSearchApiOn 'tpb'
+		$csv = Test-PtSearchApiOn 'csv'
+		if (-not $tpb -and -not $csv) {
+			return 'No search APIs are enabled. Go to Options > Search API to enable one or more.'
+		}
+		$vpn = $false
+		$blocked = $false
+		try {
+			$vpn = [bool][PowerTorrent.VpnHub]::TunnelOn
+			$blocked = [bool][PowerTorrent.VpnHub]::Blocked
+		} catch { }
+		$who = ''
+		$plural = $false
+		if ($tpb -and $csv) {
+			$who = 'The Pirate Bay and Torrents-CSV'
+			$plural = $true
+		} elseif ($tpb) {
+			$who = 'The Pirate Bay'
+		} else {
+			$who = 'Torrents-CSV'
+		}
+		if ($vpn) {
+			if ($plural) { return ($who + ' are both using the VPN.') }
+			return ($who + ' search is using the VPN.')
+		}
+		if ($blocked) {
+			if ($plural) {
+				return ($who + ' are not using the VPN. The killswitch is on and the tunnel is down, so search will not run.')
+			}
+			return ($who + ' search is not using the VPN. The killswitch is on and the tunnel is down, so search will not run.')
+		}
+		if ($plural) { return ($who + ' are not using the VPN.') }
+		return ($who + ' search is not using the VPN.')
+	}
+
+	function Update-PtSearchIdleStatus {
+		if (-not $ui.lblSearchStatus) { return }
+		if ($script:PtSearchBusy) { return }
+		try { if ([PowerTorrent.SearchJob]::IsBusy) { return } } catch { }
+		$none = -not (Test-PtSearchApiOn 'tpb') -and -not (Test-PtSearchApiOn 'csv')
+		$q = ''
+		if ($ui.txtSearch) { $q = [string]$ui.txtSearch.Text }
+		if ($null -ne $q) { $q = $q.Trim() }
+		if (-not $none -and -not [string]::IsNullOrWhiteSpace($q)) { return }
+		$ui.lblSearchStatus.Text = Get-PtSearchIdleText
+	}
+
 	function Update-PtVpnUi {
 		$has = [bool][PowerTorrent.VpnHub]::HasConfig
 		$up = [bool][PowerTorrent.VpnHub]::TunnelOn
@@ -10760,6 +10957,7 @@ function Show-PowerTorrentGui {
 		}
 		if ($ui.btnVpnConnect) { $ui.btnVpnConnect.IsEnabled = $has -and -not $up }
 		if ($ui.btnVpnStop) { $ui.btnVpnStop.IsEnabled = $has }
+		try { Update-PtSearchIdleStatus } catch { }
 	}
 
 	function Show-PtKillswitchPopup {
@@ -11102,7 +11300,7 @@ function Show-PowerTorrentGui {
 		$mode = [string]$WantState
 		if ($mode -ne 'p' -and $mode -ne 'x' -and $mode -ne 's') { $mode = 'r' }
 		try {
-			$doSeed = [bool]$ui.chkSeed.IsChecked
+			$doSeed = ((Get-PtUiFinishAction) -eq 'seed')
 			if ($mode -eq 's') { $doSeed = $true }
 			$cfg = New-PowerTorrentSettings -Source $src -OutDir $outDir -ListenPort $portVal -Peers $peerVal `
 				-Dht ([bool]$ui.chkDht.IsChecked) -Encrypt ([bool]$ui.chkEncrypt.IsChecked) -Utp ([bool]$ui.chkUtp.IsChecked) `
@@ -11133,6 +11331,7 @@ function Show-PowerTorrentGui {
 			}
 			$script:PtJobs.Add($job)
 			$script:PtRows.Add($row)
+			$script:PtHadWork = $true
 			if ($mode -eq 'x') { $eng.AfterHash = 2 }
 			elseif ($mode -eq 'p') { $eng.AfterHash = 1 }
 			else { $eng.AfterHash = 0 }
@@ -11206,8 +11405,11 @@ function Show-PowerTorrentGui {
 		$incoming = Read-PtIpc
 		if ($incoming) {
 			try {
-				if ($script:PtInTray) { Show-PtFromTray }
-				else { [void]$window.Activate() }
+				$stayTray = $false
+				if ($ui.chkOpenToTray) { $stayTray = [bool]$ui.chkOpenToTray.IsChecked }
+				if ($script:PtInTray) {
+					if (-not $stayTray) { Show-PtFromTray }
+				} else { [void]$window.Activate() }
 			} catch { }
 			foreach ($line in $incoming) { Add-PtTorrent -Source $line }
 		}
@@ -11242,7 +11444,40 @@ function Show-PowerTorrentGui {
 					$persistChanged = $true
 				}
 			}
+			$action = Get-PtUiFinishAction
+			if ($action -eq 'remove') {
+				$drop = New-Object System.Collections.Generic.List[object]
+				for ($ri = 0; $ri -lt $script:PtJobs.Count; $ri++) {
+					$rj = $script:PtJobs[$ri]
+					$rst = ''
+					try { $rst = [string]$rj.Row.Status } catch { }
+					if ($rst -eq 'Complete') { [void]$drop.Add($rj) }
+				}
+				if ($drop.Count -gt 0) {
+					foreach ($rj in $drop) {
+						try { $rj.Engine.Stop() } catch { }
+						[void]$script:PtJobs.Remove($rj)
+						[void]$script:PtRows.Remove($rj.Row)
+					}
+					$persistChanged = $true
+					$script:PtIdleMayExit = $true
+					$count = $script:PtJobs.Count
+					try { Update-FilterView } catch { }
+					try { Update-TransportButtons } catch { }
+				}
+			}
 			if ($persistChanged) { try { Save-PtActiveJobs } catch { } }
+			if ($selJob) {
+				$still = $false
+				for ($si = 0; $si -lt $script:PtJobs.Count; $si++) {
+					if ($script:PtJobs[$si].Id -eq $selJob.Id) { $still = $true; break }
+				}
+				if (-not $still) {
+					$selJob = $null
+					$selStatus = $null
+					try { $ui.lvTorrents.SelectedItem = $null } catch { }
+				}
+			}
 			$script:PtPlanetConnected = $anyPeers
 			$ui.lblDownTotal.Text = ('{0}/s' -f [PowerTorrent.Engine]::Fmt([long]$sumDown))
 			$ui.lblUpTotal.Text = ('{0}/s' -f [PowerTorrent.Engine]::Fmt([long]$sumUp))
@@ -11349,6 +11584,7 @@ function Show-PowerTorrentGui {
 				if ($ui.lstFiles) { $ui.lstFiles.Items.Clear() }
 				if ($ui.lstTrackers) { $ui.lstTrackers.Items.Clear() }
 			}
+			try { Test-PtIdleExit } catch { }
 		} catch { }
 	}
 
@@ -11388,6 +11624,7 @@ function Show-PowerTorrentGui {
 		if ($ui.btnTabSearch) { $ui.btnTabSearch.Tag = $(if ($searchOn) { '1' } else { '0' }) }
 		if ($searchOn) {
 			try { [void]$ui.txtSearch.Focus() } catch { }
+			try { Update-PtSearchIdleStatus } catch { }
 		}
 	}
 
@@ -11414,6 +11651,12 @@ function Show-PowerTorrentGui {
 		if ($ui.txtSearch) { $q = [string]$ui.txtSearch.Text }
 		if ($null -ne $q) { $q = $q.Trim() }
 		if ([string]::IsNullOrWhiteSpace($q)) { return }
+		$useTpb = Test-PtSearchApiOn 'tpb'
+		$useCsv = Test-PtSearchApiOn 'csv'
+		if (-not $useTpb -and -not $useCsv) {
+			try { Update-PtSearchIdleStatus } catch { }
+			return
+		}
 		if ([PowerTorrent.VpnHub]::Blocked) {
 			Show-PtMessage -Message 'Search is blocked while the killswitch is on and the VPN is down. Connect the VPN or turn the killswitch off.'
 			return
@@ -11422,7 +11665,7 @@ function Show-PowerTorrentGui {
 		if ($ui.btnSearchGo) { $ui.btnSearchGo.IsEnabled = $false }
 		if ($ui.lblSearchStatus) { $ui.lblSearchStatus.Text = 'Searching...' }
 		if ($script:PtSearchRows) { $script:PtSearchRows.Clear() }
-		if (-not [PowerTorrent.SearchJob]::Start($q)) {
+		if (-not [PowerTorrent.SearchJob]::Start($q, $useTpb, $useCsv)) {
 			$script:PtSearchBusy = $false
 			if ($ui.btnSearchGo) { $ui.btnSearchGo.IsEnabled = $true }
 		}
@@ -11449,11 +11692,14 @@ function Show-PowerTorrentGui {
 			$st = 'Search is blocked while the killswitch is on and the VPN is down.'
 		} elseif ($st -eq 'empty') {
 			$st = 'Type something to search.'
+		} elseif ($st -eq 'none') {
+			$st = Get-PtSearchIdleText
 		}
 		if ($ui.lblSearchStatus) {
 			if ([string]::IsNullOrWhiteSpace($st)) { $st = 'No results.' }
 			$ui.lblSearchStatus.Text = $st
 		}
+		try { Update-PtSearchIdleStatus } catch { }
 		Update-PtSearchDownloadBtn
 	}
 
@@ -11461,6 +11707,9 @@ function Show-PowerTorrentGui {
 	if ($ui.btnTabSearch) { $ui.btnTabSearch.add_Click({ Set-PtMainTab 'Search' }) }
 	if ($ui.btnSearchGo) { $ui.btnSearchGo.add_Click({ Start-PtSearch }) }
 	if ($ui.btnSearchDownload) { $ui.btnSearchDownload.add_Click({ Add-PtSearchDownload }) }
+	if ($ui.txtSearch) {
+		$ui.txtSearch.add_TextChanged({ try { Update-PtSearchIdleStatus } catch { } })
+	}
 	if ($ui.lvSearch) {
 		$ui.lvSearch.add_SelectionChanged({ Update-PtSearchDownloadBtn })
 		$ui.lvSearch.add_MouseDoubleClick({ Add-PtSearchDownload })
@@ -11581,11 +11830,19 @@ function Show-PowerTorrentGui {
 			if ($ui.miCtxStop) { $ui.miCtxStop.Visibility = $hid }
 			if ($ui.miCtxRemove) { $ui.miCtxRemove.Visibility = $hid }
 			if ($ui.miCtxSep) { $ui.miCtxSep.Visibility = $hid }
+			if ($ui.miCtxSep2) { $ui.miCtxSep2.Visibility = $hid }
+			if ($ui.miCtxOpenFolder) { $ui.miCtxOpenFolder.Visibility = $hid }
+			if ($ui.miCtxCopyMagnet) { $ui.miCtxCopyMagnet.Visibility = $hid }
+			if ($ui.miCtxCopyHash) { $ui.miCtxCopyHash.Visibility = $hid }
 			return
 		}
 		$ui.btnRemove.Visibility = $vis
 		if ($ui.miCtxRemove) { $ui.miCtxRemove.Visibility = $vis }
 		if ($ui.miCtxSep) { $ui.miCtxSep.Visibility = $vis }
+		if ($ui.miCtxSep2) { $ui.miCtxSep2.Visibility = $vis }
+		if ($ui.miCtxOpenFolder) { $ui.miCtxOpenFolder.Visibility = $vis }
+		if ($ui.miCtxCopyMagnet) { $ui.miCtxCopyMagnet.Visibility = $vis }
+		if ($ui.miCtxCopyHash) { $ui.miCtxCopyHash.Visibility = $vis }
 		$anyLive = $false
 		$anyActive = $false
 		$anyIdlePaused = $false
@@ -11680,12 +11937,107 @@ function Show-PowerTorrentGui {
 		try { Update-UiStatus } catch { }
 	}
 
+	function Get-PtJobOpenTarget($job) {
+		if ($null -eq $job) { return '' }
+		$dir = [string]$job.SavePath
+		if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Get-PtCurrentSavePath }
+		$info = $null
+		try { $info = $job.Engine.GetInfo() } catch { }
+		if ($info -and [bool]$info.IsMulti -and -not [string]::IsNullOrWhiteSpace([string]$info.Name)) {
+			$root = [System.IO.Path]::Combine($dir, [string]$info.Name)
+			if (Test-Path -LiteralPath $root) { return $root }
+		}
+		if ($info -and $info.FileCount -eq 1 -and $info.FileRows -and $info.FileRows.Length -gt 0) {
+			$rel = [string]$info.FileRows[0].Name
+			if (-not [string]::IsNullOrWhiteSpace($rel)) {
+				$file = [System.IO.Path]::Combine($dir, $rel)
+				if (Test-Path -LiteralPath $file) { return $file }
+			}
+		}
+		return $dir
+	}
+
+	function Invoke-PtOpenFolder {
+		$jobs = Get-SelectedJobs
+		if ($null -eq $jobs -or $jobs.Count -eq 0) { return }
+		$seen = @{}
+		$n = 0
+		foreach ($job in $jobs) {
+			$target = Get-PtJobOpenTarget $job
+			if ([string]::IsNullOrWhiteSpace($target)) { continue }
+			$key = $target.ToLowerInvariant()
+			if ($seen.ContainsKey($key)) { continue }
+			$seen[$key] = $true
+			$n++
+			if ($n -gt 8) { break }
+			try {
+				if (Test-Path -LiteralPath $target -PathType Leaf) {
+					Start-Process -FilePath 'explorer.exe' -ArgumentList (('/select,' + $target)) | Out-Null
+				} elseif (Test-Path -LiteralPath $target -PathType Container) {
+					Start-Process -FilePath 'explorer.exe' -ArgumentList $target | Out-Null
+				} else {
+					$parent = [System.IO.Path]::GetDirectoryName($target)
+					if (-not [string]::IsNullOrWhiteSpace($parent) -and (Test-Path -LiteralPath $parent -PathType Container)) {
+						Start-Process -FilePath 'explorer.exe' -ArgumentList $parent | Out-Null
+					}
+				}
+			} catch { }
+		}
+	}
+
+	function Invoke-PtCopyMagnet {
+		$jobs = Get-SelectedJobs
+		if ($null -eq $jobs -or $jobs.Count -eq 0) { return }
+		$lines = New-Object System.Collections.Generic.List[string]
+		foreach ($job in $jobs) {
+			$src = [string]$job.Source
+			if (-not [string]::IsNullOrWhiteSpace($src) -and $src.ToLowerInvariant().StartsWith('magnet:')) {
+				[void]$lines.Add($src)
+				continue
+			}
+			$hash = ''
+			$name = ''
+			if ($job.Row) {
+				$hash = [string]$job.Row.Hash
+				$name = [string]$job.Row.Name
+			}
+			if ([string]::IsNullOrWhiteSpace($hash)) {
+				try { $hash = [string]$job.Engine.GetInfo().InfoHashHex } catch { }
+			}
+			if ([string]::IsNullOrWhiteSpace($hash)) { continue }
+			[void]$lines.Add([PowerTorrent.TorrentSearch]::MakeMagnet($hash, $name))
+		}
+		if ($lines.Count -gt 0) {
+			try { [System.Windows.Clipboard]::SetText(([string]::Join([Environment]::NewLine, $lines.ToArray()))) } catch { }
+		}
+	}
+
+	function Invoke-PtCopyHash {
+		$jobs = Get-SelectedJobs
+		if ($null -eq $jobs -or $jobs.Count -eq 0) { return }
+		$lines = New-Object System.Collections.Generic.List[string]
+		foreach ($job in $jobs) {
+			$hash = ''
+			if ($job.Row) { $hash = [string]$job.Row.Hash }
+			if ([string]::IsNullOrWhiteSpace($hash)) {
+				try { $hash = [string]$job.Engine.GetInfo().InfoHashHex } catch { }
+			}
+			if (-not [string]::IsNullOrWhiteSpace($hash)) { [void]$lines.Add($hash.ToLowerInvariant()) }
+		}
+		if ($lines.Count -gt 0) {
+			try { [System.Windows.Clipboard]::SetText(([string]::Join([Environment]::NewLine, $lines.ToArray()))) } catch { }
+		}
+	}
+
 	$ui.btnPlayPause.add_Click({ Invoke-PtPlayPause })
 	$ui.btnStop.add_Click({ Invoke-PtStop })
 	$ui.btnRemove.add_Click({ Invoke-PtRemove })
 	if ($ui.miCtxPlayPause) { $ui.miCtxPlayPause.add_Click({ Invoke-PtPlayPause }) }
 	if ($ui.miCtxStop) { $ui.miCtxStop.add_Click({ Invoke-PtStop }) }
 	if ($ui.miCtxRemove) { $ui.miCtxRemove.add_Click({ Invoke-PtRemove }) }
+	if ($ui.miCtxOpenFolder) { $ui.miCtxOpenFolder.add_Click({ Invoke-PtOpenFolder }) }
+	if ($ui.miCtxCopyMagnet) { $ui.miCtxCopyMagnet.add_Click({ Invoke-PtCopyMagnet }) }
+	if ($ui.miCtxCopyHash) { $ui.miCtxCopyHash.add_Click({ Invoke-PtCopyHash }) }
 	$ui.lvTorrents.add_ContextMenuOpening({
 		param($sender, $e)
 		$row = $null
@@ -11798,7 +12150,10 @@ function Show-PowerTorrentGui {
 		$d = Get-PtDefaultOptions
 		$script:PtTheme = [string]$d.Theme
 		$script:PtSavePath = [string]$d.SavePath
+		$script:PtOpenToTray = Test-PtIniFlag ([string]$d.OpenToTray)
 		$script:PtCloseToTray = Test-PtIniFlag ([string]$d.CloseToTray)
+		$script:PtExitWhenIdle = Test-PtIniFlag ([string]$d.ExitWhenIdle)
+		$script:PtFinishAction = Normalize-PtFinishAction ([string]$d.FinishAction)
 		$script:PtVpnRequire = $false
 		$script:PtVpnAuto = Test-PtIniFlag ([string]$d.VpnAuto)
 		$script:PtVpnConfigText = ''
@@ -11811,8 +12166,16 @@ function Show-PowerTorrentGui {
 		if ($ui.chkEncrypt) { $ui.chkEncrypt.IsChecked = Test-PtIniFlag ([string]$d.Encrypt) }
 		if ($ui.chkUtp) { $ui.chkUtp.IsChecked = Test-PtIniFlag ([string]$d.Utp) }
 		if ($ui.chkSeq) { $ui.chkSeq.IsChecked = Test-PtIniFlag ([string]$d.Sequential) }
-		if ($ui.chkSeed) { $ui.chkSeed.IsChecked = Test-PtIniFlag ([string]$d.Seed) }
+		if ($ui.chkOpenToTray) { $ui.chkOpenToTray.IsChecked = $script:PtOpenToTray }
 		if ($ui.chkCloseToTray) { $ui.chkCloseToTray.IsChecked = $script:PtCloseToTray }
+		if ($ui.chkExitWhenIdle) { $ui.chkExitWhenIdle.IsChecked = $script:PtExitWhenIdle }
+		$script:PtSearchTpb = Test-PtIniFlag ([string]$d.SearchTpb)
+		$script:PtSearchCsv = Test-PtIniFlag ([string]$d.SearchCsv)
+		if ($ui.chkSearchTpb) { $ui.chkSearchTpb.IsChecked = $script:PtSearchTpb }
+		if ($ui.chkSearchCsv) { $ui.chkSearchCsv.IsChecked = $script:PtSearchCsv }
+		if ($ui.cmbFinishAction) {
+			$ui.cmbFinishAction.SelectedItem = Get-PtFinishActionLabel ([string]$script:PtFinishAction)
+		}
 		$script:PtVpnChkQuiet = $true
 		try {
 			if ($ui.chkVpnRequire) {
@@ -11881,6 +12244,7 @@ function Show-PowerTorrentGui {
 		$child = $ui.popOptions.Child
 		if ($null -ne $child -and [bool]$child.IsMouseOver) { return }
 		if ($ui.cmbTheme -and [bool]$ui.cmbTheme.IsDropDownOpen) { return }
+		if ($ui.cmbFinishAction -and [bool]$ui.cmbFinishAction.IsDropDownOpen) { return }
 		$ui.popOptions.IsOpen = $false
 	})
 	$window.add_StateChanged({
@@ -11889,7 +12253,16 @@ function Show-PowerTorrentGui {
 			if ($ui.popMagnet) { try { $ui.popMagnet.IsOpen = $false } catch { } }
 		}
 	})
+	function Test-PtIdleExit {
+		if ($script:PtReallyExit) { return }
+		if (-not $ui.chkExitWhenIdle -or -not [bool]$ui.chkExitWhenIdle.IsChecked) { return }
+		if (-not $script:PtHadWork) { return }
+		if (-not $script:PtIdleMayExit) { return }
+		if ($script:PtJobs -and $script:PtJobs.Count -gt 0) { return }
+		Exit-PtFromTray
+	}
 	function Hide-PtToTray {
+		param([switch]$Quiet)
 		if ($script:PtInTray -or $script:PtHidingToTray) { return }
 		$script:PtHidingToTray = $true
 		try {
@@ -11900,9 +12273,13 @@ function Show-PowerTorrentGui {
 			$script:PtInTray = $true
 			if ($script:PtNotify) {
 				$script:PtNotify.Visible = $true
-				try {
-					$script:PtNotify.ShowBalloonTip(2500, 'PowerTorrent', 'PowerTorrent is minimized to the notification area.', [System.Windows.Forms.ToolTipIcon]::Info)
-				} catch { }
+				$silent = [bool]$Quiet
+				if (-not $silent -and $ui.chkOpenToTray -and [bool]$ui.chkOpenToTray.IsChecked) { $silent = $true }
+				if (-not $silent) {
+					try {
+						$script:PtNotify.ShowBalloonTip(2500, 'PowerTorrent', 'PowerTorrent is minimized to the notification area.', [System.Windows.Forms.ToolTipIcon]::Info)
+					} catch { }
+				}
 			}
 		} finally {
 			$script:PtHidingToTray = $false
@@ -11947,6 +12324,12 @@ function Show-PowerTorrentGui {
 		try { Update-PtTrayTip -Down 0 -Up 0 -Count 0 } catch { }
 	} catch {
 		$script:PtNotify = $null
+	}
+
+	if ($ui.chkOpenToTray -and [bool]$ui.chkOpenToTray.IsChecked) {
+		$script:PtInTray = $true
+		try { $window.ShowInTaskbar = $false } catch { }
+		try { $window.WindowState = [System.Windows.WindowState]::Minimized } catch { }
 	}
 
 	$ui.btnWinMin.add_Click({ Hide-PtToTray })
@@ -12075,7 +12458,12 @@ function Show-PowerTorrentGui {
 # --- main ---
 Initialize-PowerTorrentEngine
 $script:PtTheme = 'Ice'
+$script:PtOpenToTray = $false
 $script:PtCloseToTray = $false
+$script:PtExitWhenIdle = $false
+$script:PtFinishAction = 'seed'
+$script:PtSearchTpb = $false
+$script:PtSearchCsv = $false
 $script:PtVpnRequire = $false
 $script:PtVpnAuto = $true
 $script:PtVpnConfigText = ''
@@ -12088,6 +12476,10 @@ if ($SelfTest) {
 		Write-Host "SELFTEST FAILED: $fail" -ForegroundColor Red
 		exit 1
 	}
+	if ((Normalize-PtFinishAction 'remove') -ne 'remove') { Write-Host 'SELFTEST FAILED: finish-remove' -ForegroundColor Red; exit 1 }
+	if ((Normalize-PtFinishAction 'STOP') -ne 'stop') { Write-Host 'SELFTEST FAILED: finish-stop' -ForegroundColor Red; exit 1 }
+	if ((Get-PtFinishActionCode 'Remove when done') -ne 'remove') { Write-Host 'SELFTEST FAILED: finish-label' -ForegroundColor Red; exit 1 }
+	if ((Get-PtFinishActionLabel 'seed') -ne 'Seed when done') { Write-Host 'SELFTEST FAILED: finish-seed' -ForegroundColor Red; exit 1 }
 	Write-Host 'SELFTEST OK' -ForegroundColor Green
 	exit 0
 }
