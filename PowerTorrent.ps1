@@ -21,8 +21,8 @@
 	A magnet:? URI.
 
 .PARAMETER SavePath
-	Directory that will contain the downloaded content. Defaults to the folder
-	that holds the .torrent file, or the current directory for magnets.
+	Directory that will contain the downloaded content. Defaults to the user's
+	Downloads folder.
 
 .PARAMETER Port
 	Listen port. Default 6881.
@@ -503,6 +503,326 @@ namespace PowerTorrent {
 		public string SavePath = "";
 	}
 
+	public sealed class SearchRow {
+		public string Name { get; set; }
+		public string SizeText { get; set; }
+		public string SeedsText { get; set; }
+		public string LeechText { get; set; }
+		public string Source { get; set; }
+		public string Magnet { get; set; }
+		public string Hash { get; set; }
+		public int Seeds { get; set; }
+		public int Leech { get; set; }
+		public long SizeBytes { get; set; }
+	}
+
+	public static class TorrentSearch {
+		public const string TpbUrl = "https://apibay.org/q.php?q=";
+		public const string CsvUrl = "https://torrents-csv.com/service/search?size=100&q=";
+		public static readonly string[] Trackers = new string[] {
+			"udp://tracker.internetwarriors.net:1337/announce",
+			"udp://tracker.opentrackr.org:1337/announce",
+			"udp://p4p.arenabg.ch:1337/announce",
+			"udp://tracker.openbittorrent.com:6969/announce",
+			"udp://www.torrent.eu.org:451/announce",
+			"udp://tracker.torrent.eu.org:451/announce",
+			"udp://retracker.lanta-net.ru:2710/announce",
+			"udp://open.stealth.si:80/announce",
+			"udp://exodus.desync.com:6969/announce",
+			"udp://tracker.tiny-vps.com:6969/announce"
+		};
+		public static string MakeMagnet(string hex, string name) {
+			if (string.IsNullOrEmpty(hex)) return "";
+			StringBuilder sb = new StringBuilder();
+			sb.Append("magnet:?xt=urn:btih:").Append(hex.Trim());
+			if (!string.IsNullOrEmpty(name)) {
+				sb.Append("&dn=");
+				sb.Append(Uri.EscapeDataString(name));
+			}
+			for (int i = 0; i < Trackers.Length; i++) {
+				sb.Append("&tr=");
+				sb.Append(Uri.EscapeDataString(Trackers[i]));
+			}
+			return sb.ToString();
+		}
+		public static bool IsZeroHash(string hex) {
+			if (string.IsNullOrEmpty(hex) || hex.Length < 40) return true;
+			for (int i = 0; i < hex.Length; i++) {
+				char c = hex[i];
+				if (c != '0') return false;
+			}
+			return true;
+		}
+
+		static int SkipWs(string s, int i) {
+			while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+			return i;
+		}
+		static int FindMatching(string s, int open) {
+			char oc = s[open];
+			char cc = oc == '{' ? '}' : ']';
+			int depth = 0;
+			bool inStr = false;
+			bool esc = false;
+			for (int i = open; i < s.Length; i++) {
+				char c = s[i];
+				if (inStr) {
+					if (esc) esc = false;
+					else if (c == '\\') esc = true;
+					else if (c == '"') inStr = false;
+					continue;
+				}
+				if (c == '"') { inStr = true; continue; }
+				if (c == oc) depth++;
+				else if (c == cc) {
+					depth--;
+					if (depth == 0) return i;
+				}
+			}
+			return -1;
+		}
+		static int SkipString(string s, int i, int b) {
+			if (i >= b || s[i] != '"') return i;
+			i++;
+			bool esc = false;
+			while (i < b) {
+				char c = s[i];
+				if (esc) { esc = false; i++; continue; }
+				if (c == '\\') { esc = true; i++; continue; }
+				if (c == '"') return i + 1;
+				i++;
+			}
+			return i;
+		}
+		static int SkipValue(string s, int i, int b) {
+			i = SkipWs(s, i);
+			if (i >= b) return i;
+			char c = s[i];
+			if (c == '"') return SkipString(s, i, b);
+			if (c == '{' || c == '[') {
+				int m = FindMatching(s, i);
+				return m < 0 ? b : m + 1;
+			}
+			while (i < b) {
+				char ch = s[i];
+				if (ch == ',' || ch == '}' || ch == ']' || char.IsWhiteSpace(ch)) break;
+				i++;
+			}
+			return i;
+		}
+		static string UnescapeJson(string s, int openQuote, int afterClose) {
+			if (afterClose - openQuote < 2) return "";
+			StringBuilder sb = new StringBuilder();
+			int e = openQuote + 1;
+			int last = afterClose - 1;
+			while (e < last) {
+				char ch = s[e];
+				if (ch == '\\' && e + 1 < last) {
+					char n = s[e + 1];
+					if (n == '"' || n == '\\' || n == '/') sb.Append(n);
+					else if (n == 'n') sb.Append('\n');
+					else if (n == 'r') sb.Append('\r');
+					else if (n == 't') sb.Append('\t');
+					else if (n == 'u' && e + 5 < last) {
+						int u;
+						if (int.TryParse(s.Substring(e + 2, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out u))
+							sb.Append((char)u);
+						else sb.Append(n);
+						e += 6;
+						continue;
+					} else sb.Append(n);
+					e += 2;
+					continue;
+				}
+				sb.Append(ch);
+				e++;
+			}
+			return sb.ToString();
+		}
+		static string FieldStr(string s, int a, int b, string key) {
+			if (s == null || a < 0 || b <= a || a >= s.Length || s[a] != '{') return "";
+			int i = a + 1;
+			while (i < b) {
+				i = SkipWs(s, i);
+				if (i >= b || s[i] == '}') break;
+				if (s[i] != '"') { i++; continue; }
+				int keyBeg = i;
+				int keyEnd = SkipString(s, i, b);
+				string k = UnescapeJson(s, keyBeg, keyEnd);
+				i = SkipWs(s, keyEnd);
+				if (i < b && s[i] == ':') i++;
+				i = SkipWs(s, i);
+				if (k == key) {
+					if (i < b && s[i] == '"') {
+						int vend = SkipString(s, i, b);
+						return UnescapeJson(s, i, vend);
+					}
+					int v2 = i;
+					if (v2 < b && s[v2] == '-') v2++;
+					while (v2 < b && char.IsDigit(s[v2])) v2++;
+					return s.Substring(i, v2 - i);
+				}
+				i = SkipValue(s, i, b);
+				i = SkipWs(s, i);
+				if (i < b && s[i] == ',') i++;
+			}
+			return "";
+		}
+		static long FieldLong(string s, int a, int b, string key) {
+			string v = FieldStr(s, a, b, key);
+			long n;
+			if (long.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) return n;
+			return 0;
+		}
+		static void AddRow(List<SearchRow> rows, Dictionary<string, bool> seen, string hex, string name, long size, int seeds, int leech, string source) {
+			if (string.IsNullOrEmpty(hex)) return;
+			hex = hex.Trim().ToLowerInvariant();
+			if (IsZeroHash(hex)) return;
+			if (seen.ContainsKey(hex)) return;
+			seen[hex] = true;
+			SearchRow r = new SearchRow();
+			r.Name = string.IsNullOrEmpty(name) ? hex : name;
+			r.SizeBytes = size;
+			r.SizeText = Engine.Fmt(size);
+			r.Seeds = seeds;
+			r.Leech = leech;
+			r.SeedsText = seeds.ToString(CultureInfo.InvariantCulture);
+			r.LeechText = leech.ToString(CultureInfo.InvariantCulture);
+			r.Source = source;
+			r.Hash = hex;
+			r.Magnet = MakeMagnet(hex, r.Name);
+			rows.Add(r);
+		}
+		public static void ParseObjects(string json, string hexKey, string sizeKey, string source, List<SearchRow> rows, Dictionary<string, bool> seen) {
+			if (string.IsNullOrEmpty(json) || rows == null || seen == null) return;
+			int i = 0;
+			while (i < json.Length) {
+				int a = json.IndexOf('{', i);
+				if (a < 0) break;
+				int b = FindMatching(json, a);
+				if (b < 0) break;
+				string hex = FieldStr(json, a, b, hexKey);
+				if (hex.Length < 40) {
+					if (hexKey != "info_hash") hex = FieldStr(json, a, b, "info_hash");
+					if (hex.Length < 40 && hexKey != "infohash") hex = FieldStr(json, a, b, "infohash");
+				}
+				if (hex.Length >= 40) {
+					string name = FieldStr(json, a, b, "name");
+					long size = FieldLong(json, a, b, sizeKey);
+					if (size <= 0) size = FieldLong(json, a, b, sizeKey == "size" ? "size_bytes" : "size");
+					int seeds = (int)FieldLong(json, a, b, "seeders");
+					int leech = (int)FieldLong(json, a, b, "leechers");
+					AddRow(rows, seen, hex, name, size, seeds, leech, source);
+					i = b + 1;
+				} else {
+					i = a + 1;
+				}
+			}
+		}
+		public static List<SearchRow> Run(string query, out string status) {
+			List<SearchRow> rows = new List<SearchRow>();
+			Dictionary<string, bool> seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+			status = "";
+			if (VpnHub.Blocked) {
+				status = "blocked";
+				return rows;
+			}
+			if (string.IsNullOrEmpty(query) || query.Trim().Length == 0) {
+				status = "empty";
+				return rows;
+			}
+			string enc = Uri.EscapeDataString(query.Trim());
+			string ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+			int tpbN = 0, csvN = 0;
+			string tpbErr = null, csvErr = null;
+			int st; byte[] body;
+			if (VpnHub.Blocked) { status = "blocked"; return rows; }
+			if (!VpnHub.HttpGet(TpbUrl + enc, 20000, ua, out st, out body) || body == null)
+				tpbErr = st > 0 ? st.ToString(CultureInfo.InvariantCulture) : "failed";
+			else {
+				int before = rows.Count;
+				ParseObjects(Encoding.UTF8.GetString(body), "info_hash", "size", "The Pirate Bay", rows, seen);
+				tpbN = rows.Count - before;
+			}
+			if (VpnHub.Blocked) {
+				if (csvErr == null) csvErr = "blocked";
+			} else if (!VpnHub.HttpGet(CsvUrl + enc, 20000, ua, out st, out body) || body == null)
+				csvErr = st > 0 ? st.ToString(CultureInfo.InvariantCulture) : "failed";
+			else {
+				List<SearchRow> csvRows = new List<SearchRow>();
+				Dictionary<string, bool> csvSeen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+				ParseObjects(Encoding.UTF8.GetString(body), "infohash", "size_bytes", "torrents-csv", csvRows, csvSeen);
+				csvN = csvRows.Count;
+				for (int ci = 0; ci < csvRows.Count; ci++) {
+					SearchRow cr = csvRows[ci];
+					AddRow(rows, seen, cr.Hash, cr.Name, cr.SizeBytes, cr.Seeds, cr.Leech, cr.Source);
+				}
+			}
+			rows.Sort(delegate(SearchRow x, SearchRow y) { return y.Seeds.CompareTo(x.Seeds); });
+			StringBuilder sb = new StringBuilder();
+			sb.Append("The Pirate Bay: ").Append(tpbN.ToString(CultureInfo.InvariantCulture));
+			if (tpbErr != null) sb.Append(" (").Append(tpbErr).Append(")");
+			sb.Append("    torrents-csv: ").Append(csvN.ToString(CultureInfo.InvariantCulture));
+			if (csvErr != null) sb.Append(" (").Append(csvErr).Append(")");
+			sb.Append("    ").Append(rows.Count.ToString(CultureInfo.InvariantCulture)).Append(" results");
+			status = sb.ToString();
+			return rows;
+		}
+	}
+
+	public sealed class SearchResult {
+		public bool Ready;
+		public List<SearchRow> Rows;
+		public string Status;
+	}
+
+	public static class SearchJob {
+		static readonly object gate = new object();
+		static volatile bool busy;
+		static List<SearchRow> ready;
+		static string readyStatus;
+		public static bool IsBusy { get { return busy; } }
+		public static bool Start(string query) {
+			lock (gate) {
+				if (busy) return false;
+				busy = true;
+				ready = null;
+				readyStatus = null;
+			}
+			Thread t = new Thread(delegate() {
+				string st;
+				List<SearchRow> r;
+				try { r = TorrentSearch.Run(query, out st); }
+				catch (Exception ex) {
+					st = ex.Message;
+					r = new List<SearchRow>();
+				}
+				lock (gate) {
+					ready = r;
+					readyStatus = st;
+					busy = false;
+				}
+			});
+			t.IsBackground = true;
+			t.Name = "pt-search";
+			t.Start();
+			return true;
+		}
+		public static SearchResult Poll() {
+			SearchResult r = new SearchResult();
+			lock (gate) {
+				if (busy) return r;
+				if (ready == null && readyStatus == null) return r;
+				r.Ready = true;
+				r.Rows = ready;
+				r.Status = readyStatus;
+				ready = null;
+				readyStatus = null;
+			}
+			return r;
+		}
+	}
+
 	public sealed class FileRow : INotifyPropertyChanged {
 		public event PropertyChangedEventHandler PropertyChanged;
 		void Notify(string n) {
@@ -593,7 +913,7 @@ namespace PowerTorrent {
 					return null;
 				}
 				if (VpnHub.TunnelOn) return VpnHub.Resolve(host);
-				if (VpnHub.Blocked) return null;
+				if (!VpnHub.OsAllowed) return null;
 				IPAddress[] addrs = Dns.GetHostAddresses(host);
 				for (int i = 0; i < addrs.Length; i++) {
 					if (addrs[i].AddressFamily == AddressFamily.InterNetwork) return addrs[i];
@@ -940,7 +1260,7 @@ namespace PowerTorrent {
 				if (v == null) return null;
 				return new TcpPeerIo(v);
 			}
-			if (VpnHub.Blocked) return null;
+			if (!VpnHub.OsAllowed) return null;
 			TcpClient c = new TcpClient();
 			c.NoDelay = true;
 			c.ReceiveBufferSize = 512 * 1024;
@@ -1604,14 +1924,15 @@ namespace PowerTorrent {
 
 		public bool Start(int port) {
 			if (VpnHub.Blocked) return false;
+			if (!VpnHub.TunnelOn && !VpnHub.OsAllowed) return false;
 			try {
 				if (VpnHub.TunnelOn) {
 					vudp = VpnHub.BindUdp(port);
 					Port = vudp.locPort;
-				} else {
+				} else if (VpnHub.OsAllowed) {
 					udp = new UdpClient(port);
 					Port = ((IPEndPoint)udp.Client.LocalEndPoint).Port;
-				}
+				} else return false;
 				run = true;
 				thr = new Thread(RecvLoop);
 				thr.IsBackground = true;
@@ -1645,6 +1966,7 @@ namespace PowerTorrent {
 		}
 		public UtpConn Connect(string host, int port, int timeoutMs) {
 			if (VpnHub.Blocked) return null;
+			if (!VpnHub.TunnelOn && !VpnHub.OsAllowed) return null;
 			UtpConn c = new UtpConn(this);
 			if (!c.Connect(host, port, timeoutMs)) return null;
 			return c;
@@ -2978,6 +3300,7 @@ namespace PowerTorrent {
 		public static bool HasConfig { get { return vpnKind != 0; } }
 		public static string Kind { get { return vpnKind == 2 ? "OpenVPN" : (vpnKind == 1 ? "WireGuard" : ""); } }
 		public static bool Blocked { get { return Require && HasConfig && !up; } }
+		public static bool OsAllowed { get { return !(Require && HasConfig); } }
 		public static int Mtu { get { return mtu; } }
 		public static string LocalAddress {
 			get { return localIp == 0 ? "" : string.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}.{3}", (localIp >> 24) & 255, (localIp >> 16) & 255, (localIp >> 8) & 255, localIp & 255); }
@@ -3327,11 +3650,56 @@ namespace PowerTorrent {
 			lock (gate) tcps.Remove(Key(t.remIp, t.remPort, t.locPort));
 		}
 
+		public static bool HttpGet(string url, int timeoutMs, string ua, out int status, out byte[] body) {
+			status = 0; body = null;
+			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.2";
+			if (up) return HttpRequest(url, timeoutMs, -1, -1, ua, out status, out body);
+			if (Require && HasConfig) return false;
+			return HttpOsGetBytes(url, timeoutMs, ua, out status, out body);
+		}
+		static bool HttpOsGetBytes(string url, int timeoutMs, string ua, out int status, out byte[] body) {
+			status = 0; body = null;
+			if (Require && HasConfig) return false;
+			try {
+				try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls; } catch { }
+				HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+				req.Method = "GET";
+				req.UserAgent = ua;
+				req.Timeout = timeoutMs;
+				req.ReadWriteTimeout = timeoutMs;
+				req.KeepAlive = false;
+				req.AllowAutoRedirect = true;
+				try { req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate; } catch { }
+				using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse()) {
+					status = (int)resp.StatusCode;
+					using (Stream s = resp.GetResponseStream()) {
+						if (s == null) return false;
+						MemoryStream ms = new MemoryStream();
+						byte[] buf = new byte[8192];
+						int n, total = 0;
+						while ((n = s.Read(buf, 0, buf.Length)) > 0) {
+							ms.Write(buf, 0, n);
+							total += n;
+							if (total > 4 * 1024 * 1024) break;
+						}
+						body = ms.ToArray();
+						return true;
+					}
+				}
+			} catch (WebException ex) {
+				try {
+					HttpWebResponse r = ex.Response as HttpWebResponse;
+					if (r != null) status = (int)r.StatusCode;
+				} catch { }
+				return false;
+			} catch { return false; }
+		}
 		public static bool HttpRequest(string url, int timeoutMs, long rangeStart, long rangeEnd, out int status, out byte[] body) {
 			return HttpRequest(url, timeoutMs, rangeStart, rangeEnd, "PowerTorrent/1.2", out status, out body);
 		}
 		public static bool HttpRequest(string url, int timeoutMs, long rangeStart, long rangeEnd, string ua, out int status, out byte[] body) {
 			status = 0; body = null;
+			if (!up) return false;
 			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.2";
 			Uri u; try { u = new Uri(url); } catch { return false; }
 			int port = u.Port; if (port <= 0) port = string.Equals(u.Scheme, "https", StringComparison.OrdinalIgnoreCase) ? 443 : 80;
@@ -3852,6 +4220,7 @@ namespace PowerTorrent {
 		}
 
 		static void SendInner(byte[] inner) {
+			if (!up) return;
 			if (vpnKind == 2) {
 				OvpnSess o = ovpn;
 				if (o != null) o.SendInner(inner);
@@ -4118,7 +4487,7 @@ namespace PowerTorrent {
 
 		public static int EnsureListen(int port, bool enableUtp) {
 			lock (gate) {
-				if (VpnHub.Blocked) { StopListen_NoLock(); return 0; }
+				if (VpnHub.Blocked || (!VpnHub.TunnelOn && !VpnHub.OsAllowed)) { StopListen_NoLock(); return 0; }
 				if (port <= 0) port = 6881;
 				if (VpnHub.TunnelOn) {
 					if (vpnBound && boundPort > 0) {
@@ -4143,6 +4512,7 @@ namespace PowerTorrent {
 					}
 					return boundPort;
 				}
+				if (!VpnHub.OsAllowed) { StopListen_NoLock(); return 0; }
 				if (vpnBound) StopListen_NoLock();
 				if (listener != null) {
 					if (enableUtp && utpHub == null && boundPort > 0) {
@@ -4350,6 +4720,7 @@ namespace PowerTorrent {
 		int spdI;
 		double spdSum;
 		double etaSmooth = -1;
+		int idleTicks;
 		double activeSecs;
 		DateTime lastRecycle = DateTime.MinValue;
 		int activePeerThreads;
@@ -4372,6 +4743,8 @@ namespace PowerTorrent {
 		List<string> magnetWebseeds = new List<string>();
 		byte[] v2Hash;
 		bool v2Only;
+		public int AfterHash;
+		bool hashedThisRun;
 
 		sealed class FileEnt {
 			public string Path;
@@ -4647,6 +5020,7 @@ namespace PowerTorrent {
 			Engine eng;
 			Meta m;
 			FileStream[] streams;
+			long[] fileOldLen;
 			object gate = new object();
 			bool[] done;
 			int[] avail;
@@ -4716,14 +5090,30 @@ namespace PowerTorrent {
 				return false;
 			}
 
-			public void Open() {
+			public void Open() { Open(true); }
+			public void Open(bool create) {
+				if (streams != null) Close();
 				streams = new FileStream[m.Files.Count];
+				fileOldLen = new long[m.Files.Count];
 				for (int i = 0; i < m.Files.Count; i++) {
 					FileEnt f = m.Files[i];
+					long old = 0;
+					try { if (File.Exists(f.Path)) old = new FileInfo(f.Path).Length; } catch { }
+					fileOldLen[i] = old;
+					if (!create && old <= 0) {
+						streams[i] = null;
+						continue;
+					}
 					string dir = Path.GetDirectoryName(f.Path);
-					if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
-					streams[i] = new FileStream(f.Path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite, 2 * 1024 * 1024, FileOptions.SequentialScan);
-					if (streams[i].Length != f.Length) streams[i].SetLength(f.Length);
+					if (create && !string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+					FileMode mode = create ? FileMode.OpenOrCreate : FileMode.Open;
+					FileAccess acc = create ? FileAccess.ReadWrite : FileAccess.Read;
+					try {
+						streams[i] = new FileStream(f.Path, mode, acc, FileShare.ReadWrite, 2 * 1024 * 1024, FileOptions.SequentialScan);
+						if (create && streams[i].Length != f.Length) streams[i].SetLength(f.Length);
+					} catch {
+						streams[i] = null;
+					}
 				}
 			}
 
@@ -4773,6 +5163,7 @@ namespace PowerTorrent {
 					long local = offset - f.Offset;
 					int nbyte = (int)Math.Min((long)remain, f.Length - local);
 					FileStream s = streams[f.Index];
+					if (s == null) throw new IOException("missing");
 					lock (s) {
 						s.Seek(local, SeekOrigin.Begin);
 						if (write) {
@@ -4808,10 +5199,9 @@ namespace PowerTorrent {
 				if (workers == 1) {
 					byte[] tmp = new byte[pieceLen];
 					for (int i = 0; i < n && eng.running; i++) {
-						while (eng.paused && eng.running) Thread.Sleep(100);
 						if (!eng.running) return;
 						HashOne(i, tmp);
-						if ((i & 15) == 0) eng.OnHashProgress(i + 1, n);
+						if (i == 0 || (i & 15) == 0) eng.OnHashProgress(i + 1, n);
 					}
 				} else {
 					int next = 0;
@@ -4827,11 +5217,10 @@ namespace PowerTorrent {
 									if (next >= n) return;
 									i = next++;
 								}
-								while (eng.paused && eng.running) Thread.Sleep(100);
 								if (!eng.running) return;
 								HashOne(i, tmp);
 								int h = Interlocked.Increment(ref hashed);
-								if ((h & 15) == 0) eng.OnHashProgress(h, n);
+								if (h == 1 || (h & 15) == 0) eng.OnHashProgress(h, n);
 							}
 						});
 						th[w].IsBackground = true;
@@ -4849,7 +5238,23 @@ namespace PowerTorrent {
 				}
 			}
 
+			bool PieceMayHaveData(int idx) {
+				if (fileOldLen == null) return true;
+				long start = (long)idx * (long)pieceLen;
+				int sz = PieceSize(idx);
+				long end = start + sz;
+				for (int fi = 0; fi < m.Files.Count; fi++) {
+					FileEnt f = m.Files[fi];
+					long fe = f.Offset + f.Length;
+					if (end <= f.Offset || start >= fe) continue;
+					long localStart = start > f.Offset ? start - f.Offset : 0;
+					if (fileOldLen[fi] > localStart) return true;
+				}
+				return false;
+			}
+
 			void HashOne(int i, byte[] tmp) {
+				if (!PieceMayHaveData(i)) return;
 				int sz = PieceSize(i);
 				bool readOk = true;
 				try { IO((long)i * (long)pieceLen, tmp, 0, sz, false); }
@@ -5393,6 +5798,7 @@ namespace PowerTorrent {
 			}
 
 			bool Connect() {
+				if (VpnHub.Blocked) return false;
 				if (io != null) return Handshake();
 				if (incoming && tcp != null) {
 					TcpPeerIo tio = new TcpPeerIo(tcp);
@@ -5415,7 +5821,7 @@ namespace PowerTorrent {
 						return Handshake();
 					}
 				}
-				if (!VpnHub.TunnelOn && Session.Utp != null && eng.settings.EnableUtp) {
+				if (!VpnHub.TunnelOn && VpnHub.OsAllowed && Session.Utp != null && eng.settings.EnableUtp) {
 					try {
 						UtpConn uc = Session.Utp.Connect(host, port, 2000);
 						if (uc != null) {
@@ -5976,6 +6382,7 @@ namespace PowerTorrent {
 			spdI = 0;
 			spdSum = 0;
 			etaSmooth = -1;
+			idleTicks = 0;
 		}
 
 		public void Pause() {
@@ -6019,6 +6426,13 @@ namespace PowerTorrent {
 			}
 			sessionReg = true;
 			running = true;
+			if (infoReady && !hashedThisRun) {
+				lock (statusLock) {
+					status.State = "Hashing";
+					status.PiecesDone = 0;
+					status.PiecesTotal = meta != null ? meta.PieceCount : 0;
+				}
+			}
 			coordThread = new Thread(Coordinator);
 			coordThread.IsBackground = true;
 			coordThread.Name = "PowerTorrent";
@@ -6045,6 +6459,7 @@ namespace PowerTorrent {
 		public void Stop() {
 			paused = false;
 			running = false;
+			hashedThisRun = false;
 			ZeroRates();
 			PeerWorker[] snap;
 			lock (peerLock) snap = peers.ToArray();
@@ -6122,10 +6537,14 @@ namespace PowerTorrent {
 					hpDone = status.PiecesDone;
 					hpTot = status.PiecesTotal;
 				}
-				s.PiecesDone = hpDone;
-				s.PiecesTotal = hpTot > 0 ? hpTot : tot;
-				s.ProgressPercent = s.PiecesTotal > 0 ? (100.0 * hpDone / s.PiecesTotal) : 0;
-				s.Eta = "checking";
+				s.PiecesDone = dc;
+				s.PiecesTotal = tot > 0 ? tot : hpTot;
+				s.Downloaded = ver;
+				s.ProgressPercent = s.TotalSize > 0 ? (100.0 * ver / s.TotalSize) : 0;
+				if (hpTot > 0)
+					s.Eta = "checking " + hpDone.ToString(CultureInfo.InvariantCulture) + "/" + hpTot.ToString(CultureInfo.InvariantCulture);
+				else
+					s.Eta = "checking";
 			} else {
 				s.ProgressPercent = s.TotalSize > 0 ? (100.0 * ver / s.TotalSize) : 0;
 				s.PiecesDone = dc;
@@ -6166,20 +6585,19 @@ namespace PowerTorrent {
 		string FormatEta(long remain) {
 			if (remain <= 0) return "00:00:00";
 			double avgWin = spdN > 0 ? spdSum / spdN : 0;
-			double avgHist = (activeSecs >= 3) ? (double)Interlocked.Read(ref sessionDown) / activeSecs : 0;
+			double avgHist = (activeSecs >= 4) ? (double)Interlocked.Read(ref sessionDown) / activeSecs : 0;
 			double rate;
-			if (avgWin > 64 && avgHist > 64) rate = 0.55 * avgWin + 0.45 * avgHist;
-			else if (avgWin > 64) rate = avgWin;
-			else if (avgHist > 64) rate = avgHist;
+			if (avgWin > 256 && avgHist > 256) rate = 0.65 * avgWin + 0.35 * avgHist;
+			else if (avgWin > 256) rate = avgWin;
+			else if (avgHist > 256) rate = avgHist;
 			else rate = 0;
-			if (rate < 64) {
-				if (etaSmooth > 0 && avgWin > 0) return FormatEtaSec(etaSmooth);
+			if (rate < 256) {
+				if (etaSmooth > 2 && avgWin > 64) return FormatEtaSec(etaSmooth);
 				return "--";
 			}
 			double sec = remain / rate;
 			if (etaSmooth < 0) etaSmooth = sec;
-			else if (sec < etaSmooth) etaSmooth = 0.55 * etaSmooth + 0.45 * sec;
-			else etaSmooth = 0.85 * etaSmooth + 0.15 * sec;
+			else etaSmooth = etaSmooth * 0.75 + sec * 0.25;
 			if (etaSmooth < 0) etaSmooth = 0;
 			if (etaSmooth > 359999) etaSmooth = 359999;
 			return FormatEtaSec(etaSmooth);
@@ -6299,6 +6717,22 @@ namespace PowerTorrent {
 					for (int i = 0; i < batch.Count; i++) Session.Unregister(batch[i]);
 				}
 				if (Session.TorrentCount != 0) return "session-cleanup";
+				string magS = TorrentSearch.MakeMagnet("0123456789abcdef0123456789abcdef01234567", "a b");
+				if (magS.IndexOf("btih:0123456789abcdef0123456789abcdef01234567", StringComparison.Ordinal) < 0) return "search-mag";
+				if (magS.IndexOf("dn=a%20b", StringComparison.Ordinal) < 0) return "search-dn";
+				if (!TorrentSearch.IsZeroHash("0000000000000000000000000000000000000000")) return "search-zero";
+				List<SearchRow> parsed = new List<SearchRow>();
+				Dictionary<string, bool> seenS = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+				TorrentSearch.ParseObjects("[{\"info_hash\":\"0123456789abcdef0123456789abcdef01234567\",\"name\":\"x\",\"size\":\"10\",\"seeders\":\"3\",\"leechers\":\"1\"}]", "info_hash", "size", "The Pirate Bay", parsed, seenS);
+				if (parsed.Count != 1 || parsed[0].Seeds != 3 || parsed[0].SizeBytes != 10) return "search-parse";
+				List<SearchRow> parsedCsv = new List<SearchRow>();
+				Dictionary<string, bool> seenCsv = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+				TorrentSearch.ParseObjects("{\"torrents\":[{\"infohash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"one\",\"size_bytes\":11,\"seeders\":4,\"leechers\":2},{\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"name\":\"two\",\"size_bytes\":22,\"seeders\":5,\"leechers\":1}],\"next\":9}", "infohash", "size_bytes", "torrents-csv", parsedCsv, seenCsv);
+				if (parsedCsv.Count != 2 || parsedCsv[0].Name != "one" || parsedCsv[1].Name != "two" || parsedCsv[1].SizeBytes != 22) return "search-parse-csv";
+				bool oldReq = VpnHub.Require;
+				VpnHub.Require = false;
+				if (!VpnHub.OsAllowed) { VpnHub.Require = oldReq; return "os-allowed"; }
+				VpnHub.Require = oldReq;
 				string vpnFail = VpnHub.SelfCheck();
 				if (vpnFail != null) return "vpn-" + vpnFail;
 				return null;
@@ -6325,6 +6759,60 @@ namespace PowerTorrent {
 				status.PiecesDone = cur;
 				status.PiecesTotal = tot;
 			}
+		}
+
+		void HashExistingFiles() {
+			if (!infoReady || pieces == null) return;
+			if (hashedThisRun) {
+				pieces.Open(true);
+				return;
+			}
+			lock (statusLock) {
+				status.State = "Hashing";
+				status.PiecesDone = 0;
+				status.PiecesTotal = meta != null ? meta.PieceCount : 0;
+			}
+			Log(1, "checking existing pieces...");
+			pieces.Open(AfterHash != 2);
+			pieces.HashCheck();
+			if (!running) return;
+			hashedThisRun = true;
+			int dc0, tot0; long ver0, totb0;
+			pieces.Snapshot(out dc0, out tot0, out ver0, out totb0);
+			Log(1, "have " + dc0.ToString(CultureInfo.InvariantCulture) + "/" + tot0.ToString(CultureInfo.InvariantCulture) + " pieces (" + Fmt(ver0) + ")");
+		}
+
+		bool ApplyAfterHash() {
+			int mode = AfterHash;
+			AfterHash = 0;
+			if (mode == 2) {
+				FinishStoppedAfterHash();
+				return false;
+			}
+			if (mode == 1) {
+				paused = true;
+				ZeroRates();
+				lock (statusLock) status.State = "Paused";
+				Log(1, "paused after hash");
+			}
+			return true;
+		}
+
+		void FinishStoppedAfterHash() {
+			paused = false;
+			running = false;
+			ZeroRates();
+			if (pieces != null) pieces.Close();
+			if (sessionReg) {
+				Session.Unregister(this);
+				sessionReg = false;
+			}
+			lock (statusLock) {
+				if (status.State == "Error") return;
+				if (pieces != null && pieces.IsComplete) status.State = "Complete";
+				else status.State = "Stopped";
+			}
+			Log(1, "stopped after hash");
 		}
 
 		void BroadcastHave(int piece) {
@@ -6488,19 +6976,26 @@ namespace PowerTorrent {
 		void UpdateSpeed() {
 			DateTime n = DateTime.UtcNow;
 			double dt = (n - lastSp).TotalSeconds;
-			if (dt < 0.12) return;
+			if (dt < 0.85) return;
+			if (dt > 8) dt = 8;
 			long dl = Interlocked.Read(ref sessionDown);
 			long ul = Interlocked.Read(ref sessionUp);
 			double nd = (dl - lastDl) / dt;
 			double nu = (ul - lastUl) / dt;
-			if (downBps < 32 && nd > 0) downBps = nd;
-			else downBps = downBps * 0.35 + nd * 0.65;
-			if (upBps < 32 && nu > 0) upBps = nu;
-			else upBps = upBps * 0.35 + nu * 0.65;
+			if (nd < 0) nd = 0;
+			if (nu < 0) nu = 0;
+			if (downBps < 1) downBps = nd;
+			else downBps = downBps * 0.8 + nd * 0.2;
+			if (upBps < 1) upBps = nu;
+			else upBps = upBps * 0.8 + nu * 0.2;
+			if (nd < 32 && nu < 32) {
+				idleTicks++;
+				if (idleTicks >= 3) { downBps = 0; upBps = 0; }
+			} else idleTicks = 0;
 			if (spdN == 30) spdSum -= spdWin[spdI];
 			else spdN++;
-			spdWin[spdI] = nd;
-			spdSum += nd;
+			spdWin[spdI] = downBps;
+			spdSum += downBps;
 			spdI = (spdI + 1) % 30;
 			if (nd > 0 || nu > 0) activeSecs += dt;
 			lastDl = dl;
@@ -6516,36 +7011,42 @@ namespace PowerTorrent {
 				ServicePointManager.DefaultConnectionLimit = 64;
 				ServicePointManager.Expect100Continue = false;
 
+				if (infoReady) {
+					HashExistingFiles();
+					if (!running) return;
+					if (!ApplyAfterHash()) return;
+				}
+
 				while (running && VpnHub.Blocked) {
 					lock (statusLock) {
-						status.State = "VPN";
-						status.ErrorMessage = string.IsNullOrEmpty(VpnHub.LastError) ? "VPN down" : VpnHub.LastError;
+						if (paused) status.State = "Paused";
+						else {
+							status.State = "VPN";
+							status.ErrorMessage = string.IsNullOrEmpty(VpnHub.LastError) ? "VPN down" : VpnHub.LastError;
+						}
 					}
 					Thread.Sleep(400);
 				}
 				if (!running) return;
 				lock (statusLock) status.ErrorMessage = "";
 
-				lock (statusLock) status.State = "Preparing";
 				Log(1, "info hash " + meta.InfoHashHex);
 				if (VpnHub.TunnelOn) Log(1, "VPN tunnel " + VpnHub.Status);
 				StartListen();
 				if (!string.IsNullOrEmpty(settings.ForcedPeer)) RememberPeer(settings.ForcedPeer);
 
-				if (meta.Trackers.Count > 0) {
-					lock (statusLock) status.State = infoReady ? "Announcing" : "Metadata";
-					Log(1, "announcing to " + meta.Trackers.Count.ToString(CultureInfo.InvariantCulture) + " tracker(s)");
-					AnnounceAll("started");
-					startedAnnounced = true;
-				}
-
-				if (settings.EnableDht) {
-					dhtThread = new Thread(DhtRun);
-					dhtThread.IsBackground = true;
-					dhtThread.Start();
-				}
-
 				if (!infoReady) {
+					if (meta.Trackers.Count > 0) {
+						lock (statusLock) status.State = "Metadata";
+						Log(1, "announcing to " + meta.Trackers.Count.ToString(CultureInfo.InvariantCulture) + " tracker(s)");
+						AnnounceAll("started");
+						startedAnnounced = true;
+					}
+					if (settings.EnableDht) {
+						dhtThread = new Thread(DhtRun);
+						dhtThread.IsBackground = true;
+						dhtThread.Start();
+					}
 					lock (statusLock) status.State = "Metadata";
 					if (meta.Trackers.Count == 0 && !settings.EnableDht && string.IsNullOrEmpty(settings.ForcedPeer))
 						Log(0, "magnet has no trackers, DHT is off, and no -Peer was given");
@@ -6559,27 +7060,25 @@ namespace PowerTorrent {
 					}
 					if (!running) return;
 					ApplyFetchedInfo();
+					HashExistingFiles();
+					if (!running) return;
+					if (!ApplyAfterHash()) return;
 				}
 
-				lock (statusLock) status.State = "Preparing";
-				pieces.Open();
-				lock (statusLock) status.State = "Hashing";
-				Log(1, "checking existing pieces...");
-				pieces.HashCheck();
-				if (!running) return;
+				if (settings.EnableDht && dhtThread == null) {
+					dhtThread = new Thread(DhtRun);
+					dhtThread.IsBackground = true;
+					dhtThread.Start();
+				}
 
-				int dc0, tot0; long ver0, totb0;
-				pieces.Snapshot(out dc0, out tot0, out ver0, out totb0);
-				Log(1, "have " + dc0.ToString(CultureInfo.InvariantCulture) + "/" + tot0.ToString(CultureInfo.InvariantCulture) + " pieces (" + Fmt(ver0) + ")");
-
-				if (meta.Trackers.Count > 0) {
+				if (meta.Trackers.Count > 0 && !paused) {
 					lock (statusLock) status.State = "Announcing";
 					string ev = startedAnnounced ? "" : "started";
 					AnnounceAll(ev);
 					startedAnnounced = true;
 				}
 
-				if (meta.Webseeds.Count > 0) {
+				if (meta.Webseeds.Count > 0 && !paused) {
 					int wn = Math.Min(4, Math.Max(2, meta.Webseeds.Count));
 					if (Session.TorrentCount > 15) wn = 1;
 					else if (Session.TorrentCount > 8) wn = Math.Min(wn, 2);
@@ -6610,6 +7109,11 @@ namespace PowerTorrent {
 						lock (statusLock) status.State = "Paused";
 						Thread.Sleep(250);
 						continue;
+					}
+					if (!startedAnnounced && meta.Trackers.Count > 0) {
+						lock (statusLock) status.State = "Announcing";
+						AnnounceAll("started");
+						startedAnnounced = true;
 					}
 					UpdateSpeed();
 					RecyclePeers();
@@ -6773,11 +7277,11 @@ namespace PowerTorrent {
 			IPEndPoint dest = new IPEndPoint(ip, uri.Port);
 			try {
 				if (VpnHub.TunnelOn) vs = VpnHub.BindUdp(0);
-				else {
+				else if (VpnHub.OsAllowed) {
 					udp = new UdpClient();
 					udp.Client.ReceiveTimeout = 8000;
 					udp.Connect(ip, uri.Port);
-				}
+				} else return;
 				Random rng = new Random(Guid.NewGuid().GetHashCode());
 				byte[] req = new byte[16];
 				Bt.W64(req, 0, 0x41727101980L);
@@ -6885,7 +7389,7 @@ namespace PowerTorrent {
 				if (VpnHub.TunnelOn) {
 					int st;
 					if (!VpnHub.HttpRequest(sb.ToString(), 15000, -1, -1, out st, out body) || body == null) return;
-				} else {
+				} else if (VpnHub.OsAllowed) {
 					HttpWebRequest req = (HttpWebRequest)WebRequest.Create(sb.ToString());
 					req.Method = "GET";
 					req.UserAgent = "PowerTorrent/1.2";
@@ -6901,34 +7405,34 @@ namespace PowerTorrent {
 						while ((n = rs.Read(tmp, 0, tmp.Length)) > 0) ms.Write(tmp, 0, n);
 						body = ms.ToArray();
 					}
+				} else return;
+				Be dict = Benc.Decode(body);
+				if (dict == null || dict.Dict == null) return;
+				Be fail = dict.Get("failure reason");
+				if (fail != null && fail.Bytes != null) {
+					Log(1, "tracker " + url + ": " + Encoding.UTF8.GetString(fail.Bytes));
+					return;
 				}
-					Be dict = Benc.Decode(body);
-					if (dict == null || dict.Dict == null) return;
-					Be fail = dict.Get("failure reason");
-					if (fail != null && fail.Bytes != null) {
-						Log(1, "tracker " + url + ": " + Encoding.UTF8.GetString(fail.Bytes));
-						return;
+				long iv = dict.GetInt("interval", 0);
+				if (iv >= 60) {
+					lock (statusLock) {
+						if ((int)iv < announceInterval) announceInterval = (int)iv;
 					}
-					long iv = dict.GetInt("interval", 0);
-					if (iv >= 60) {
-						lock (statusLock) {
-							if ((int)iv < announceInterval) announceInterval = (int)iv;
-						}
+				}
+				int complete = (int)dict.GetInt("complete", -1);
+				if (complete >= 0) NoteSwarm(complete);
+				Be p = dict.Get("peers");
+				if (p != null && p.Bytes != null) Bt.AddCompactPeers(p.Bytes, peersOut);
+				else if (p != null && p.List != null) {
+					for (int i = 0; i < p.List.Count; i++) {
+						Be d2 = p.List[i];
+						if (d2.Dict == null) continue;
+						string ip = d2.Str("ip");
+						long prt = d2.GetInt("port", 0);
+						if (!string.IsNullOrEmpty(ip) && prt > 0)
+							peersOut.Add(ip + ":" + prt.ToString(CultureInfo.InvariantCulture));
 					}
-					int complete = (int)dict.GetInt("complete", -1);
-					if (complete >= 0) NoteSwarm(complete);
-					Be p = dict.Get("peers");
-					if (p != null && p.Bytes != null) Bt.AddCompactPeers(p.Bytes, peersOut);
-					else if (p != null && p.List != null) {
-						for (int i = 0; i < p.List.Count; i++) {
-							Be d2 = p.List[i];
-							if (d2.Dict == null) continue;
-							string ip = d2.Str("ip");
-							long prt = d2.GetInt("port", 0);
-							if (!string.IsNullOrEmpty(ip) && prt > 0)
-								peersOut.Add(ip + ":" + prt.ToString(CultureInfo.InvariantCulture));
-						}
-					}
+				}
 			} catch (Exception ex) {
 				Log(2, "HTTP " + url + " " + ex.Message);
 			}
@@ -6992,6 +7496,7 @@ namespace PowerTorrent {
 			while (running) {
 				if (!settings.EnableDht) { Thread.Sleep(400); continue; }
 				if (VpnHub.Blocked) { Thread.Sleep(400); continue; }
+				if (!VpnHub.TunnelOn && !VpnHub.OsAllowed) { Thread.Sleep(400); continue; }
 				if (pieces != null && pieces.IsComplete) break;
 				if (nodes.Count == 0) {
 					tried.Clear();
@@ -7019,11 +7524,11 @@ namespace PowerTorrent {
 					IPEndPoint dest = new IPEndPoint(ip, p);
 					try {
 						if (VpnHub.TunnelOn) vs = VpnHub.BindUdp(0);
-						else {
+						else if (VpnHub.OsAllowed) {
 							udp = new UdpClient();
 							udp.Client.ReceiveTimeout = 2500;
 							udp.Connect(ip, p);
-						}
+						} else continue;
 						SendUdp(vs, udp, msg, dest);
 						byte[] resp = RecvUdp(vs, udp, 2500);
 						if (resp == null) continue;
@@ -7147,6 +7652,7 @@ namespace PowerTorrent {
 				Buffer.BlockCopy(body, 0, dest, destOff, n);
 				return true;
 			}
+			if (!VpnHub.OsAllowed) return false;
 			HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
 			req.Method = "GET";
 			req.UserAgent = "PowerTorrent/1.2";
@@ -7360,6 +7866,23 @@ function Test-PowerTorrentMagnetAssociation {
 	} catch { return $false }
 }
 
+function Test-PowerTorrentTorrentAssociation {
+	try {
+		$hkcu = [Microsoft.Win32.Registry]::CurrentUser
+		$ext = $hkcu.OpenSubKey('Software\Classes\.torrent')
+		if (-not $ext) { return $false }
+		$prog = [string]$ext.GetValue('')
+		$ext.Close()
+		if ($prog -ne 'PowerTorrent.torrent') { return $false }
+		$k = $hkcu.OpenSubKey('Software\Classes\PowerTorrent.torrent\shell\open\command')
+		if (-not $k) { return $false }
+		$v = [string]$k.GetValue('')
+		$k.Close()
+		$script = Get-PowerTorrentScriptPath
+		return ($v -like ('*{0}*' -f [System.IO.Path]::GetFileName($script)))
+	} catch { return $false }
+}
+
 function Get-DefaultSavePath {
 	$dl = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'
 	if (Test-Path -LiteralPath $dl) { return $dl }
@@ -7369,10 +7892,6 @@ function Get-DefaultSavePath {
 function Get-PtIniPath {
 	$dir = Split-Path -Parent (Get-PowerTorrentScriptPath)
 	Join-Path $dir 'PowerTorrent.ini'
-}
-
-function Get-PtLegacyIniPath {
-	Join-Path $env:APPDATA 'PowerTorrent\PowerTorrent.ini'
 }
 
 function Get-PtDefaultOptions {
@@ -7426,11 +7945,7 @@ function Write-PtUtf8File([string]$Path, [string[]]$Lines) {
 function Read-PtIni {
 	$map = @{}
 	$p = Get-PtIniPath
-	if (-not (Test-Path -LiteralPath $p)) {
-		$legacy = Get-PtLegacyIniPath
-		if (Test-Path -LiteralPath $legacy) { $p = $legacy }
-		else { return $map }
-	}
+	if (-not (Test-Path -LiteralPath $p)) { return $map }
 	try {
 		$text = Read-PtUtf8Text $p
 		if ([string]::IsNullOrEmpty($text)) { return $map }
@@ -7950,10 +8465,6 @@ function Import-PtIniToSession {
 	if ($ini.ContainsKey('VpnAuto')) { $script:PtVpnAuto = Test-PtIniFlag $ini['VpnAuto'] }
 }
 
-function Get-PtVpnConfPath {
-	Join-Path (Split-Path -Parent (Get-PowerTorrentScriptPath)) 'PowerTorrent.vpn.conf'
-}
-
 function ConvertTo-PtVpnIniValue([string]$text) {
 	if ([string]::IsNullOrEmpty($text)) { return '' }
 	[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text))
@@ -7989,12 +8500,6 @@ function Initialize-PtVpn {
 			}
 		}
 	} catch { }
-	if ([string]::IsNullOrEmpty($text)) {
-		$conf = Get-PtVpnConfPath
-		if (Test-Path -LiteralPath $conf) {
-			try { $text = [System.IO.File]::ReadAllText($conf) } catch { $text = '' }
-		}
-	}
 	if ([string]::IsNullOrEmpty($text)) {
 		$script:PtVpnRequire = $false
 		try { [PowerTorrent.VpnHub]::Require = $false } catch { }
@@ -8458,6 +8963,7 @@ function Show-PowerTorrentGui {
 	<StreamGeometry x:Key="GeoChevronRight">M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoGear">M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoFolder">M10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6H12L10,4Z</StreamGeometry>
+	<StreamGeometry x:Key="GeoSearch">M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L20.13,19.42L18.72,20.83L13.03,15.14C11.89,16.11 10.41,16.7 8.8,16.7C5.24,16.7 2.3,13.76 2.3,10.2C2.3,6.64 5.24,3.7 8.8,3.7M9.5,5A4.5,4.5 0 0,0 5,9.5A4.5,4.5 0 0,0 9.5,14A4.5,4.5 0 0,0 14,9.5A4.5,4.5 0 0,0 9.5,5Z</StreamGeometry>
 	<SolidColorBrush x:Key="Theme.WindowBg" Color="#141A1E"/>
 	<SolidColorBrush x:Key="Theme.Text" Color="#E8F4F8"/>
 	<SolidColorBrush x:Key="Theme.Muted" Color="#A8C4CC"/>
@@ -8633,6 +9139,40 @@ function Show-PowerTorrentGui {
 	  </Setter>
 	</Style>
 	<Style TargetType="Button" BasedOn="{StaticResource DlgBtn}"/>
+	<Style x:Key="ViewTabBtn" TargetType="Button">
+	  <Setter Property="Background" Value="Transparent"/>
+	  <Setter Property="Foreground" Value="{DynamicResource Theme.Muted}"/>
+	  <Setter Property="BorderThickness" Value="0"/>
+	  <Setter Property="Padding" Value="16,5"/>
+	  <Setter Property="FontSize" Value="12"/>
+	  <Setter Property="FontWeight" Value="SemiBold"/>
+	  <Setter Property="MinWidth" Value="92"/>
+	  <Setter Property="Tag" Value="0"/>
+	  <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+	  <Setter Property="OverridesDefaultStyle" Value="True"/>
+	  <Setter Property="Template">
+		<Setter.Value>
+		  <ControlTemplate TargetType="Button">
+			<Border x:Name="bd" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"
+					BorderThickness="0,0,0,2" BorderBrush="Transparent" SnapsToDevicePixels="True">
+			  <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+			</Border>
+			<ControlTemplate.Triggers>
+			  <Trigger Property="IsMouseOver" Value="True">
+				<Setter TargetName="bd" Property="Background" Value="{DynamicResource HoverFace}"/>
+				<Setter Property="Foreground" Value="{DynamicResource Theme.Text}"/>
+			  </Trigger>
+			  <Trigger Property="Tag" Value="1">
+				<Setter TargetName="bd" Property="Background" Value="{DynamicResource BarFace}"/>
+				<Setter TargetName="bd" Property="BorderBrush" Value="{DynamicResource Theme.AccentHi}"/>
+				<Setter Property="Foreground" Value="{DynamicResource Theme.Text}"/>
+				<Setter Property="FontWeight" Value="SemiBold"/>
+			  </Trigger>
+			</ControlTemplate.Triggers>
+		  </ControlTemplate>
+		</Setter.Value>
+	  </Setter>
+	</Style>
 	<Style TargetType="TextBox">
 	  <Setter Property="Background" Value="{DynamicResource Theme.Fill}"/>
 	  <Setter Property="Foreground" Value="{DynamicResource Theme.Text}"/>
@@ -8864,6 +9404,7 @@ function Show-PowerTorrentGui {
 	  <Setter Property="Background" Value="{DynamicResource HeadFace}"/>
 	  <Setter Property="Foreground" Value="{DynamicResource Theme.Muted}"/>
 	  <Setter Property="Padding" Value="6,5"/>
+	  <Setter Property="Cursor" Value="Hand"/>
 	  <Setter Property="HorizontalContentAlignment" Value="Left"/>
 	  <Setter Property="OverridesDefaultStyle" Value="True"/>
 	  <Setter Property="Template">
@@ -9280,7 +9821,11 @@ function Show-PowerTorrentGui {
 		<DropShadowEffect Color="#000000" BlurRadius="6" ShadowDepth="1" Opacity="0.28" Direction="270"/>
 	  </Border.Effect>
 	  <Grid>
-	  <DockPanel>
+		<Grid.ColumnDefinitions>
+		  <ColumnDefinition Width="*"/>
+		  <ColumnDefinition Width="Auto"/>
+		</Grid.ColumnDefinitions>
+		<StackPanel Orientation="Horizontal" VerticalAlignment="Center">
 		<Button x:Name="btnAddFile" Style="{StaticResource DlgBtn}" Margin="0,0,6,0" ToolTip="Add torrent">
 		  <StackPanel Orientation="Horizontal">
 			<Path Style="{StaticResource IcoOnBtn}" Data="{StaticResource GeoPlus}"/>
@@ -9305,18 +9850,28 @@ function Show-PowerTorrentGui {
 			<TextBlock Text="Stop" VerticalAlignment="Center"/>
 		  </StackPanel>
 		</Button>
-		<Button x:Name="btnRemove" Style="{StaticResource DlgBtn}" Margin="0,0,16,0" ToolTip="Remove" Visibility="Collapsed">
+		<Button x:Name="btnRemove" Style="{StaticResource DlgBtn}" Margin="0,0,0,0" ToolTip="Remove" Visibility="Collapsed">
 		  <StackPanel Orientation="Horizontal">
 			<Path Style="{StaticResource IcoOnBtn}" Data="{StaticResource GeoMinus}"/>
 			<TextBlock Text="Remove" VerticalAlignment="Center"/>
 		  </StackPanel>
 		</Button>
-		<TextBlock Text="Save to" VerticalAlignment="Center" Foreground="{DynamicResource Theme.Muted}" Margin="0,0,6,0"/>
-		<Button x:Name="btnOptions" Style="{StaticResource DlgBtn}" DockPanel.Dock="Right" Width="32" Padding="0" Margin="6,0,0,0" ToolTip="Options">
-		  <Path Style="{StaticResource IcoOnBtn}" Margin="0" Width="14" Height="14" Data="{StaticResource GeoGear}"/>
-		</Button>
-		<TextBox x:Name="txtSave" Height="26" IsReadOnly="True" VerticalContentAlignment="Center" ToolTip="Default save path — change in Options"/>
-	  </DockPanel>
+		</StackPanel>
+		<StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+		  <Border x:Name="pnlMainTabs" BorderBrush="{DynamicResource Theme.Border}" BorderThickness="1"
+				  CornerRadius="3" Background="{DynamicResource Theme.FillDeep}" Margin="0,0,8,0"
+				  VerticalAlignment="Center" SnapsToDevicePixels="True">
+			<StackPanel Orientation="Horizontal">
+			  <Button x:Name="btnTabTransfers" Style="{StaticResource ViewTabBtn}" Tag="1" Content="Transfers" ToolTip="Transfers"/>
+			  <Border Width="1" Background="{DynamicResource Theme.Border}" Margin="0,5"/>
+			  <Button x:Name="btnTabSearch" Style="{StaticResource ViewTabBtn}" Tag="0" Content="Search"
+					  ToolTip="Search The Pirate Bay and torrents-csv"/>
+			</StackPanel>
+		  </Border>
+		  <Button x:Name="btnOptions" Style="{StaticResource DlgBtn}" Width="32" Padding="0" ToolTip="Options">
+			<Path Style="{StaticResource IcoOnBtn}" Margin="0" Width="14" Height="14" Data="{StaticResource GeoGear}"/>
+		  </Button>
+		</StackPanel>
 		<Popup x:Name="popOptions" Placement="Bottom" PlacementTarget="{Binding ElementName=btnOptions}"
 			   StaysOpen="True" AllowsTransparency="True" PopupAnimation="Fade" HorizontalOffset="-280">
 		  <Border Background="{DynamicResource Theme.WindowBg}" BorderBrush="{DynamicResource Theme.Border}"
@@ -9393,7 +9948,7 @@ function Show-PowerTorrentGui {
 				  <Border Height="1" Background="{DynamicResource Theme.Border}" Margin="0,2,0,12"/>
 				  <TextBlock Text="File associations" FontWeight="SemiBold" Margin="0,0,0,8"/>
 				  <TextBlock x:Name="lblAssoc" Foreground="{DynamicResource Theme.Muted}" FontSize="11" Margin="0,0,0,8"
-							 TextWrapping="Wrap" Text="magnet: not registered"/>
+							 TextWrapping="Wrap" Text="magnet: not registered&#x0a;.torrent: not registered"/>
 				  <Button x:Name="btnRegister" Style="{StaticResource DlgBtn}"
 						  HorizontalAlignment="Stretch" Margin="0,0,0,6">
 					<StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
@@ -9408,11 +9963,16 @@ function Show-PowerTorrentGui {
 					  <TextBlock Text="Register .torrent" VerticalAlignment="Center"/>
 					</StackPanel>
 				  </Button>
-				  <Button x:Name="btnUnregister" Style="{StaticResource DlgBtn}" HorizontalAlignment="Stretch">
+				  <Button x:Name="btnUnregister" Style="{StaticResource DlgBtn}" HorizontalAlignment="Stretch" Margin="0,0,0,12">
 					<StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
 					  <Path Style="{StaticResource IcoOnBtn}" Data="{StaticResource GeoMinus}"/>
 					  <TextBlock Text="Remove associations" VerticalAlignment="Center"/>
 					</StackPanel>
+				  </Button>
+				  <Border Height="1" Background="{DynamicResource Theme.Border}" Margin="0,2,0,10"/>
+				  <Button x:Name="btnResetOptions" Style="{StaticResource DlgBtn}" HorizontalAlignment="Stretch"
+						  ToolTip="Clear the saved settings file and restore defaults. File associations are not changed.">
+					<TextBlock Text="Reset settings" VerticalAlignment="Center" Foreground="{DynamicResource Theme.Muted}"/>
 				  </Button>
 				</StackPanel>
 			  </ScrollViewer>
@@ -9437,6 +9997,7 @@ function Show-PowerTorrentGui {
 	  </DockPanel>
 	</Border>
 	<Grid x:Name="grdBody" Background="{DynamicResource Theme.WindowBg}">
+	  <Grid x:Name="grdTransfers" Background="{DynamicResource Theme.WindowBg}">
 	  <Grid.ColumnDefinitions>
 		<ColumnDefinition x:Name="colFilter" Width="150"/>
 		<ColumnDefinition Width="18"/>
@@ -9686,6 +10247,40 @@ function Show-PowerTorrentGui {
 		  </Border>
 		</Popup>
 	  </Grid>
+	  </Grid>
+	  <DockPanel x:Name="pnlSearch" Visibility="Collapsed" Background="{DynamicResource Theme.WindowBg}">
+		<Border DockPanel.Dock="Top" Padding="10,8" Background="{DynamicResource ToolFace}">
+		  <DockPanel>
+			<Button x:Name="btnSearchGo" Style="{StaticResource DlgBtn}" DockPanel.Dock="Right" Margin="6,0,0,0" MinWidth="80"
+					ToolTip="Search The Pirate Bay and torrents-csv">
+			  <StackPanel Orientation="Horizontal">
+				<Path Style="{StaticResource IcoOnBtn}" Data="{StaticResource GeoSearch}"/>
+				<TextBlock Text="Search" VerticalAlignment="Center"/>
+			  </StackPanel>
+			</Button>
+			<Button x:Name="btnSearchDownload" Style="{StaticResource DlgBtn}" DockPanel.Dock="Right" MinWidth="90" IsEnabled="False"
+					ToolTip="Download the selected result">
+			  <TextBlock Text="Download" VerticalAlignment="Center"/>
+			</Button>
+			<TextBox x:Name="txtSearch" Height="26" VerticalContentAlignment="Center"
+					 ToolTip="Search The Pirate Bay and torrents-csv"/>
+		  </DockPanel>
+		</Border>
+		<TextBlock x:Name="lblSearchStatus" DockPanel.Dock="Bottom" Margin="10,6" Foreground="{DynamicResource Theme.Muted}"
+				   FontSize="11" Text="The Pirate Bay and torrents-csv. Search uses the VPN when it is connected."/>
+		<ListView x:Name="lvSearch" Style="{StaticResource PtListView}" Background="{DynamicResource Theme.WindowBg}"
+				  Foreground="{DynamicResource Theme.Text}" BorderThickness="0" SelectionMode="Single">
+		  <ListView.View>
+			<GridView>
+			  <GridViewColumn Header="Name" Width="420" DisplayMemberBinding="{Binding Name}"/>
+			  <GridViewColumn Header="Size" Width="90" DisplayMemberBinding="{Binding SizeText}"/>
+			  <GridViewColumn Header="Seeds" Width="70" DisplayMemberBinding="{Binding SeedsText}"/>
+			  <GridViewColumn Header="Leech" Width="70" DisplayMemberBinding="{Binding LeechText}"/>
+			  <GridViewColumn Header="Source" Width="140" DisplayMemberBinding="{Binding Source}"/>
+			</GridView>
+		  </ListView.View>
+		</ListView>
+	  </DockPanel>
 	</Grid>
   </DockPanel>
 </Window>
@@ -9696,15 +10291,17 @@ function Show-PowerTorrentGui {
 
 	$ui = @{}
 	foreach ($n in @(
-			'hdrBar','imgPlanet','txtSave','txtSaveFlyout','btnBrowseDir','chkDht','chkEncrypt','chkUtp','chkSeq','chkSeed','chkCloseToTray',
+			'hdrBar','imgPlanet','txtSaveFlyout','btnBrowseDir','chkDht','chkEncrypt','chkUtp','chkSeq','chkSeed','chkCloseToTray',
 			'chkVpnRequire','btnVpnImport','btnVpnConnect','btnVpnStop','lblVpnStatus','lblVpnConn','lblVpnSaved','pnlVpnConfigured',
 			'txtPort','txtPeers','cmbTheme','btnSaveOptions','btnAddFile','btnAddMagnet','btnPlayPause','icoPlayPause','txtPlayPause','btnStop','btnRemove',
 			'scrGeneral','pnlGeneral','lblName','lblSavePath','lblHash','lblComment','lblCreated','lblState','lblProgress','lblPieces','lblPeers','lblRatio','lblAvail','lblSpeed',
 			'txtLog','lstFiles','lstTrackers','btnRegister','btnRegisterTorrent',
-			'btnUnregister','lblAssoc','lblFooter','lblTotals','lblDownTotal','lblUpTotal',
+			'btnUnregister','btnResetOptions','lblAssoc','lblFooter','lblTotals','lblDownTotal','lblUpTotal',
 			'btnWinMin','btnWinMax','btnWinClose','pathWinMax','pathWinClose','btnOptions','popOptions',
 			'lvTorrents','lstFilter','colFilter','btnFilterFold','icoFilterFold','popMagnet','txtMagnet','btnMagnetOk','btnMagnetCancel',
-			'ctxTorrents','miCtxPlayPause','icoCtxPlayPause','miCtxStop','miCtxRemove','miCtxSep'
+			'ctxTorrents','miCtxPlayPause','icoCtxPlayPause','miCtxStop','miCtxRemove','miCtxSep',
+			'btnTabTransfers','btnTabSearch','grdTransfers','pnlSearch',
+			'txtSearch','btnSearchGo','btnSearchDownload','lvSearch','lblSearchStatus'
 		)) {
 		$ui[$n] = $window.FindName($n)
 	}
@@ -9772,9 +10369,19 @@ function Show-PowerTorrentGui {
 	$script:PtNextPort = [int]$Port
 	if ($script:PtNextPort -le 0) { $script:PtNextPort = 6881 }
 
-	if ($InitialSave) { $ui.txtSave.Text = $InitialSave }
-	else { $ui.txtSave.Text = Get-DefaultSavePath }
-	if ($ui.txtSaveFlyout) { $ui.txtSaveFlyout.Text = $ui.txtSave.Text }
+	if ($InitialSave) { $script:PtSavePath = $InitialSave }
+	else { $script:PtSavePath = Get-DefaultSavePath }
+	if ($ui.txtSaveFlyout) { $ui.txtSaveFlyout.Text = $script:PtSavePath }
+	$script:PtMainTab = 'Transfers'
+	$script:PtSearchBusy = $false
+	$script:PtSearchRows = New-Object 'System.Collections.ObjectModel.ObservableCollection[PowerTorrent.SearchRow]'
+	$script:PtSearchView = $null
+	$script:PtSearchSortProp = ''
+	$script:PtSearchSortDir = ''
+	if ($ui.lvSearch) {
+		$ui.lvSearch.ItemsSource = $script:PtSearchRows
+		try { $script:PtSearchView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:PtSearchRows) } catch { }
+	}
 	$ui.txtPort.Text = [string]$Port
 	$ui.txtPeers.Text = [string]$MaxPeers
 	$ui.chkDht.IsChecked = -not [bool]$NoDht
@@ -9976,11 +10583,7 @@ function Show-PowerTorrentGui {
 		$peerVal = Get-PtInt -Text $ui.txtPeers.Text -Fallback 80
 		$th = [string]$ui.cmbTheme.SelectedItem
 		if ([string]::IsNullOrWhiteSpace($th)) { $th = 'Ice' }
-		$save = [string]$ui.txtSave.Text
-		if ($ui.txtSaveFlyout -and -not [string]::IsNullOrWhiteSpace($ui.txtSaveFlyout.Text)) {
-			$save = [string]$ui.txtSaveFlyout.Text
-			$ui.txtSave.Text = $save
-		}
+		$save = Get-PtCurrentSavePath
 		$map = @{
 			Theme	   = $th
 			Dht		   = Get-PtBoolText ([bool]$ui.chkDht.IsChecked)
@@ -10041,12 +10644,12 @@ function Show-PowerTorrentGui {
 	}
 	$ui.txtPort.add_LostFocus($optSync)
 	$ui.txtPeers.add_LostFocus($optSync)
-	$ui.txtSave.add_LostFocus({ Update-SaveOptionsButton })
 	$ui.cmbTheme.add_SelectionChanged({
 		$th = [string]$ui.cmbTheme.SelectedItem
 		if ($th) {
 			$script:PtTheme = $th
 			try { Apply-PtTheme $window $th } catch { }
+			try { Set-PtMainTab $script:PtMainTab } catch { }
 		}
 		try { Update-SaveOptionsButton } catch { }
 	})
@@ -10054,10 +10657,6 @@ function Show-PowerTorrentGui {
 		try {
 			Merge-PtIni (Get-PtUiOptionMap)
 			$script:PtVpnSavedText = [string]$script:PtVpnConfigText
-			$legacy = Get-PtVpnConfPath
-			if (Test-Path -LiteralPath $legacy) {
-				try { Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue } catch { }
-			}
 			try { Update-PtVpnUi } catch { }
 			Update-SaveOptionsButton
 			Add-UiLog 'Options saved'
@@ -10073,11 +10672,11 @@ function Show-PowerTorrentGui {
 	try { Update-SaveOptionsButton } catch { }
 
 	function Update-AssocLabel {
-		if (Test-PowerTorrentMagnetAssociation) {
-			$ui.lblAssoc.Text = 'magnet: registered for this user'
-		} else {
-			$ui.lblAssoc.Text = 'magnet: not registered'
-		}
+		$mag = 'not registered'
+		$tor = 'not registered'
+		if (Test-PowerTorrentMagnetAssociation) { $mag = 'registered' }
+		if (Test-PowerTorrentTorrentAssociation) { $tor = 'registered' }
+		$ui.lblAssoc.Text = ('magnet: {0}{1}.torrent: {2}' -f $mag, [Environment]::NewLine, $tor)
 	}
 	Update-AssocLabel
 
@@ -10319,17 +10918,23 @@ function Show-PowerTorrentGui {
 	}
 
 	function Get-PtCurrentSavePath {
-		$p = [string]$ui.txtSave.Text
+		$p = [string]$script:PtSavePath
 		if ($ui.txtSaveFlyout -and -not [string]::IsNullOrWhiteSpace($ui.txtSaveFlyout.Text)) {
 			$p = [string]$ui.txtSaveFlyout.Text
-			$ui.txtSave.Text = $p
+			$script:PtSavePath = $p
 		}
+		if ([string]::IsNullOrWhiteSpace($p)) { $p = Get-DefaultSavePath }
 		return $p
 	}
 
 	function Get-PtPersistMode {
 		param($Job, $Status)
 		if ($null -eq $Job) { return 'x' }
+		try {
+			$ah = [int]$Job.Engine.AfterHash
+			if ($ah -eq 2) { return 'x' }
+			if ($ah -eq 1) { return 'p' }
+		} catch { }
 		try {
 			if ($Job.Engine.IsPaused) { return 'p' }
 		} catch { }
@@ -10463,16 +11068,11 @@ function Show-PowerTorrentGui {
 			}
 			$script:PtJobs.Add($job)
 			$script:PtRows.Add($row)
-			if ($mode -eq 'x') {
-				try { $eng.Stop() } catch { }
-				try { $row.Apply($eng.GetStatus()) } catch { }
-				$row.Status = 'Stopped'
-			} elseif ($mode -eq 'p') {
-				try { $eng.Pause() } catch { }
-				try { $eng.Start() } catch { }
-			} else {
-				$eng.Start()
-			}
+			if ($mode -eq 'x') { $eng.AfterHash = 2 }
+			elseif ($mode -eq 'p') { $eng.AfterHash = 1 }
+			else { $eng.AfterHash = 0 }
+			try { $eng.Start() } catch { }
+			try { $row.Apply($eng.GetStatus()) } catch { }
 			if (-not [string]::IsNullOrWhiteSpace($NameHint)) { $row.Name = $NameHint }
 			$script:PtPlanetConnected = $true
 			$ui.lvTorrents.SelectedItem = $row
@@ -10536,16 +11136,21 @@ function Show-PowerTorrentGui {
 		try { $script:PtNotify.Text = $tip } catch { }
 	}
 
+	function Read-PtIncoming {
+		try { Complete-PtSearchIfReady } catch { }
+		$incoming = Read-PtIpc
+		if ($incoming) {
+			try {
+				if ($script:PtInTray) { Show-PtFromTray }
+				else { [void]$window.Activate() }
+			} catch { }
+			foreach ($line in $incoming) { Add-PtTorrent -Source $line }
+		}
+	}
+
 	function Update-UiStatus {
 		try {
-			$incoming = Read-PtIpc
-			if ($incoming) {
-				try {
-					if ($script:PtInTray) { Show-PtFromTray }
-					else { [void]$window.Activate() }
-				} catch { }
-				foreach ($line in $incoming) { Add-PtTorrent -Source $line }
-			}
+			Read-PtIncoming
 			$anyPeers = $false
 			$sumDown = [double]0
 			$sumUp = [double]0
@@ -10553,10 +11158,14 @@ function Show-PowerTorrentGui {
 			$sumUl = [long]0
 			$count = $script:PtJobs.Count
 			$persistChanged = $false
+			$selJob = $null
+			try { $selJob = Get-SelectedJob } catch { }
+			$selStatus = $null
 			for ($i = 0; $i -lt $count; $i++) {
 				$job = $script:PtJobs[$i]
 				try { $s = $job.Engine.GetStatus() } catch { continue }
 				$job.Row.Apply($s)
+				if ($selJob -and $job.Id -eq $selJob.Id) { $selStatus = $s }
 				$sumDown += [double]$s.DownBytesPerSec
 				$sumUp += [double]$s.UpBytesPerSec
 				$sumDl += [long]$s.Downloaded
@@ -10580,10 +11189,12 @@ function Show-PowerTorrentGui {
 			try { Update-PtVpnUi } catch { }
 			try { Show-PtVpnWarn } catch { }
 			Update-TransportButtons
-			$job = Get-SelectedJob
+			$job = $selJob
 			if ($job) {
 				if ($ui.scrGeneral) { $ui.scrGeneral.Visibility = [System.Windows.Visibility]::Visible }
-				$s = $job.Engine.GetStatus()
+				$s = $selStatus
+				if ($null -eq $s) { try { $s = $job.Engine.GetStatus() } catch { $s = $null } }
+				if ($null -eq $s) { return }
 				$ui.lblName.Text = ('Name: {0}' -f $(if ($s.Name) { $s.Name } else { '-' }))
 				$ui.lblHash.Text = ('Hash: {0}' -f $(if ($s.InfoHashHex) { $s.InfoHashHex } else { '-' }))
 				$ui.lblState.Text = ('State: {0}' -f $s.State)
@@ -10678,7 +11289,7 @@ function Show-PowerTorrentGui {
 
 	function Set-PtSavePathDisplay([string]$p) {
 		if ([string]::IsNullOrWhiteSpace($p)) { return }
-		$ui.txtSave.Text = $p
+		$script:PtSavePath = $p
 		if ($ui.txtSaveFlyout) { $ui.txtSaveFlyout.Text = $p }
 		try { Update-SaveOptionsButton } catch { }
 	}
@@ -10686,7 +11297,7 @@ function Show-PowerTorrentGui {
 		$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
 		$dlg.Description = 'Choose download folder'
 		$cur = [string]$ui.txtSaveFlyout.Text
-		if (-not $cur) { $cur = [string]$ui.txtSave.Text }
+		if (-not $cur) { $cur = [string]$script:PtSavePath }
 		if ($cur) { $dlg.SelectedPath = $cur }
 		if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 			Set-PtSavePathDisplay $dlg.SelectedPath
@@ -10695,10 +11306,183 @@ function Show-PowerTorrentGui {
 	if ($ui.txtSaveFlyout) {
 		$ui.txtSaveFlyout.add_LostFocus({
 			$p = [string]$ui.txtSaveFlyout.Text
-			if ($p) { $ui.txtSave.Text = $p.Trim() }
+			if ($p) { $script:PtSavePath = $p.Trim() }
 			try { Update-SaveOptionsButton } catch { }
 		})
 	}
+
+	function Set-PtMainTab([string]$name) {
+		if ([string]::IsNullOrWhiteSpace($name)) { $name = 'Transfers' }
+		$script:PtMainTab = $name
+		$hid = [System.Windows.Visibility]::Collapsed
+		$vis = [System.Windows.Visibility]::Visible
+		$searchOn = ($name -eq 'Search')
+		if ($ui.grdTransfers) { $ui.grdTransfers.Visibility = $(if ($searchOn) { $hid } else { $vis }) }
+		if ($ui.pnlSearch) { $ui.pnlSearch.Visibility = $(if ($searchOn) { $vis } else { $hid }) }
+		if ($ui.btnTabTransfers) { $ui.btnTabTransfers.Tag = $(if ($searchOn) { '0' } else { '1' }) }
+		if ($ui.btnTabSearch) { $ui.btnTabSearch.Tag = $(if ($searchOn) { '1' } else { '0' }) }
+		if ($searchOn) {
+			try { [void]$ui.txtSearch.Focus() } catch { }
+		}
+	}
+
+	function Update-PtSearchDownloadBtn {
+		if (-not $ui.btnSearchDownload) { return }
+		$sel = $null
+		try { $sel = $ui.lvSearch.SelectedItem } catch { }
+		$ui.btnSearchDownload.IsEnabled = ($null -ne $sel)
+	}
+
+	function Add-PtSearchDownload {
+		$sel = $null
+		try { $sel = $ui.lvSearch.SelectedItem } catch { }
+		if ($null -eq $sel) { return }
+		$mag = [string]$sel.Magnet
+		if ([string]::IsNullOrWhiteSpace($mag)) { return }
+		Set-PtMainTab 'Transfers'
+		Add-PtTorrent -Source $mag -NameHint ([string]$sel.Name)
+	}
+
+	function Start-PtSearch {
+		if ([PowerTorrent.SearchJob]::IsBusy) { return }
+		$q = ''
+		if ($ui.txtSearch) { $q = [string]$ui.txtSearch.Text }
+		if ($null -ne $q) { $q = $q.Trim() }
+		if ([string]::IsNullOrWhiteSpace($q)) { return }
+		if ([PowerTorrent.VpnHub]::Blocked) {
+			Show-PtMessage -Message 'Search is blocked while the killswitch is on and the VPN is down. Connect the VPN or turn the killswitch off.'
+			return
+		}
+		$script:PtSearchBusy = $true
+		if ($ui.btnSearchGo) { $ui.btnSearchGo.IsEnabled = $false }
+		if ($ui.lblSearchStatus) { $ui.lblSearchStatus.Text = 'Searching...' }
+		if ($script:PtSearchRows) { $script:PtSearchRows.Clear() }
+		if (-not [PowerTorrent.SearchJob]::Start($q)) {
+			$script:PtSearchBusy = $false
+			if ($ui.btnSearchGo) { $ui.btnSearchGo.IsEnabled = $true }
+		}
+	}
+
+	function Complete-PtSearchIfReady {
+		if (-not $script:PtSearchBusy -and -not [PowerTorrent.SearchJob]::IsBusy) { return }
+		$res = [PowerTorrent.SearchJob]::Poll()
+		if (-not $res -or -not $res.Ready) { return }
+		$script:PtSearchBusy = $false
+		if ($ui.btnSearchGo) { $ui.btnSearchGo.IsEnabled = $true }
+		if ($script:PtSearchRows) { $script:PtSearchRows.Clear() }
+		$rows = $res.Rows
+		if ($rows) {
+			for ($i = 0; $i -lt $rows.Count; $i++) {
+				[void]$script:PtSearchRows.Add($rows[$i])
+			}
+		}
+		if ($script:PtSearchView -and [string]$script:PtSearchSortProp) {
+			try { $script:PtSearchView.Refresh() } catch { }
+		}
+		$st = [string]$res.Status
+		if ($st -eq 'blocked') {
+			$st = 'Search is blocked while the killswitch is on and the VPN is down.'
+		} elseif ($st -eq 'empty') {
+			$st = 'Type something to search.'
+		}
+		if ($ui.lblSearchStatus) {
+			if ([string]::IsNullOrWhiteSpace($st)) { $st = 'No results.' }
+			$ui.lblSearchStatus.Text = $st
+		}
+		Update-PtSearchDownloadBtn
+	}
+
+	if ($ui.btnTabTransfers) { $ui.btnTabTransfers.add_Click({ Set-PtMainTab 'Transfers' }) }
+	if ($ui.btnTabSearch) { $ui.btnTabSearch.add_Click({ Set-PtMainTab 'Search' }) }
+	if ($ui.btnSearchGo) { $ui.btnSearchGo.add_Click({ Start-PtSearch }) }
+	if ($ui.btnSearchDownload) { $ui.btnSearchDownload.add_Click({ Add-PtSearchDownload }) }
+	if ($ui.lvSearch) {
+		$ui.lvSearch.add_SelectionChanged({ Update-PtSearchDownloadBtn })
+		$ui.lvSearch.add_MouseDoubleClick({ Add-PtSearchDownload })
+		function Get-PtSearchHeaderBase([string]$header) {
+			if ([string]::IsNullOrWhiteSpace($header)) { return '' }
+			$up = [char]0x25B2
+			$dn = [char]0x25BC
+			return $header.Trim().TrimEnd($up, $dn).Trim()
+		}
+		function Get-PtSearchSortProp([string]$header) {
+			switch (Get-PtSearchHeaderBase $header) {
+				'Name' { return 'Name' }
+				'Size' { return 'SizeBytes' }
+				'Seeds' { return 'Seeds' }
+				'Leech' { return 'Leech' }
+				'Source' { return 'Source' }
+				default { return '' }
+			}
+		}
+		function Update-PtSearchSortHeaders {
+			if (-not $ui.lvSearch -or -not $ui.lvSearch.View) { return }
+			$up = [char]0x25B2
+			$dn = [char]0x25BC
+			$mark = $(if ($script:PtSearchSortDir -eq 'Descending') { $dn } else { $up })
+			$prop = [string]$script:PtSearchSortProp
+			foreach ($col in @($ui.lvSearch.View.Columns)) {
+				$base = Get-PtSearchHeaderBase ([string]$col.Header)
+				if ([string]::IsNullOrWhiteSpace($base)) { continue }
+				$p = Get-PtSearchSortProp $base
+				if ($prop -and $p -eq $prop) { $col.Header = ('{0} {1}' -f $base, $mark) }
+				else { $col.Header = $base }
+			}
+		}
+		function Set-PtSearchSort([string]$prop) {
+			if ([string]::IsNullOrWhiteSpace($prop)) { return }
+			$dirName = 'Ascending'
+			if ([string]$script:PtSearchSortProp -eq $prop) {
+				if ([string]$script:PtSearchSortDir -eq 'Ascending') { $dirName = 'Descending' }
+			} else {
+				if ($prop -eq 'Name' -or $prop -eq 'Source') { $dirName = 'Ascending' }
+				else { $dirName = 'Descending' }
+			}
+			$script:PtSearchSortProp = $prop
+			$script:PtSearchSortDir = $dirName
+			$view = $script:PtSearchView
+			if (-not $view) {
+				try { $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:PtSearchRows) } catch { }
+				$script:PtSearchView = $view
+			}
+			if (-not $view) { return }
+			$dir = [System.ComponentModel.ListSortDirection]::Ascending
+			if ($dirName -eq 'Descending') { $dir = [System.ComponentModel.ListSortDirection]::Descending }
+			try {
+				$view.SortDescriptions.Clear()
+				[void]$view.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription $prop, $dir))
+				$view.Refresh()
+			} catch { }
+			Update-PtSearchSortHeaders
+		}
+		$sortClick = [System.Windows.RoutedEventHandler]{
+			param($sender, $e)
+			if ($e.OriginalSource -is [System.Windows.Controls.Primitives.Thumb]) { return }
+			$h = $e.OriginalSource
+			while ($null -ne $h -and $h -isnot [System.Windows.Controls.GridViewColumnHeader]) {
+				try { $h = [System.Windows.Media.VisualTreeHelper]::GetParent($h) } catch { $h = $null }
+			}
+			if ($null -eq $h) { return }
+			if ($h.Role -eq [System.Windows.Controls.GridViewColumnHeaderRole]::Padding) { return }
+			$col = $h.Column
+			if ($null -eq $col) { return }
+			$prop = Get-PtSearchSortProp ([string]$col.Header)
+			if (-not $prop) { return }
+			Set-PtSearchSort $prop
+			$e.Handled = $true
+		}
+		$ui.lvSearch.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $sortClick)
+	}
+	if ($ui.txtSearch) {
+		$ui.txtSearch.add_KeyDown({
+			param($sender, $e)
+			if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+				$e.Handled = $true
+				Start-PtSearch
+			}
+		})
+	}
+
 	$ui.btnAddFile.add_Click({
 		$dlg = New-Object System.Windows.Forms.OpenFileDialog
 		$dlg.Filter = 'Torrent files (*.torrent)|*.torrent|All files (*.*)|*.*'
@@ -10945,6 +11729,66 @@ function Show-PowerTorrentGui {
 		Update-AssocLabel
 		Show-PtMessage -Message "Removed this user's magnet: / PowerTorrent .torrent associations." | Out-Null
 	})
+	function Reset-PtSavedOptions {
+		$d = Get-PtDefaultOptions
+		$script:PtTheme = [string]$d.Theme
+		$script:PtSavePath = [string]$d.SavePath
+		$script:PtCloseToTray = Test-PtIniFlag ([string]$d.CloseToTray)
+		$script:PtVpnRequire = $false
+		$script:PtVpnAuto = Test-PtIniFlag ([string]$d.VpnAuto)
+		$script:PtVpnConfigText = ''
+		$script:PtVpnSavedText = ''
+		$script:PtNextPort = Get-PtInt -Text ([string]$d.Port) -Fallback 6881
+		if ($ui.txtSaveFlyout) { $ui.txtSaveFlyout.Text = $script:PtSavePath }
+		if ($ui.txtPort) { $ui.txtPort.Text = [string]$d.Port }
+		if ($ui.txtPeers) { $ui.txtPeers.Text = [string]$d.MaxPeers }
+		if ($ui.chkDht) { $ui.chkDht.IsChecked = Test-PtIniFlag ([string]$d.Dht) }
+		if ($ui.chkEncrypt) { $ui.chkEncrypt.IsChecked = Test-PtIniFlag ([string]$d.Encrypt) }
+		if ($ui.chkUtp) { $ui.chkUtp.IsChecked = Test-PtIniFlag ([string]$d.Utp) }
+		if ($ui.chkSeq) { $ui.chkSeq.IsChecked = Test-PtIniFlag ([string]$d.Sequential) }
+		if ($ui.chkSeed) { $ui.chkSeed.IsChecked = Test-PtIniFlag ([string]$d.Seed) }
+		if ($ui.chkCloseToTray) { $ui.chkCloseToTray.IsChecked = $script:PtCloseToTray }
+		$script:PtVpnChkQuiet = $true
+		try {
+			if ($ui.chkVpnRequire) {
+				$ui.chkVpnRequire.IsChecked = $false
+				$ui.chkVpnRequire.IsEnabled = $false
+			}
+		} finally { $script:PtVpnChkQuiet = $false }
+		try { [PowerTorrent.VpnHub]::Require = $false } catch { }
+		try { [PowerTorrent.VpnHub]::ClearConfig() } catch { }
+		if ($ui.cmbTheme) {
+			$th = [string]$d.Theme
+			if ($ui.cmbTheme.Items.Contains($th)) { $ui.cmbTheme.SelectedItem = $th }
+			else { $ui.cmbTheme.SelectedItem = 'Ice' }
+		}
+		try { Apply-PtTheme $window $script:PtTheme } catch { }
+		try { Set-PtMainTab $script:PtMainTab } catch { }
+		try { Sync-LiveOptions } catch { }
+		try { Update-PtVpnUi } catch { }
+		try { Update-SaveOptionsButton } catch { }
+	}
+	if ($ui.btnResetOptions) {
+		$ui.btnResetOptions.add_Click({
+			$r = Show-PtMessage -Message "Reset all saved options to defaults?`nThis removes the settings file and any saved VPN config. File associations are not changed." -Buttons YesNo
+			if ($r -ne 'Yes') { return }
+			$keepNotice = $false
+			try {
+				$ini = Read-PtIni
+				if (Test-PtIniFlag ([string]$ini['NoticeAccepted'])) { $keepNotice = $true }
+			} catch { }
+			$iniPath = Get-PtIniPath
+			if (-not [string]::IsNullOrWhiteSpace($iniPath) -and (Test-Path -LiteralPath $iniPath)) {
+				try { Remove-Item -LiteralPath $iniPath -Force -ErrorAction SilentlyContinue } catch { }
+			}
+			if ($keepNotice) {
+				try { Merge-PtIni @{ NoticeAccepted = '1' } } catch { }
+			}
+			Reset-PtSavedOptions
+			Add-UiLog 'Settings reset to defaults'
+			Show-PtMessage -Message 'Settings were reset to defaults.' | Out-Null
+		})
+	}
 
 	function Update-MaxCaptionIcon {
 		if ($window.WindowState -eq [System.Windows.WindowState]::Maximized) {
@@ -10960,7 +11804,7 @@ function Show-PowerTorrentGui {
 		switch ([bool]$ui.popOptions.IsOpen) {
 			$true  { $ui.popOptions.IsOpen = $false }
 			$false {
-				if ($ui.txtSaveFlyout) { $ui.txtSaveFlyout.Text = $ui.txtSave.Text }
+				if ($ui.txtSaveFlyout) { $ui.txtSaveFlyout.Text = $script:PtSavePath }
 				$ui.popOptions.IsOpen = $true
 			}
 		}
@@ -11086,9 +11930,13 @@ function Show-PowerTorrentGui {
 	})
 
 	$timer = New-Object System.Windows.Threading.DispatcherTimer
-	$timer.Interval = [TimeSpan]::FromMilliseconds(200)
+	$timer.Interval = [TimeSpan]::FromMilliseconds(1000)
 	$timer.add_Tick({ Update-UiStatus })
 	$timer.Start()
+	$ipcTimer = New-Object System.Windows.Threading.DispatcherTimer
+	$ipcTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+	$ipcTimer.add_Tick({ try { Read-PtIncoming } catch { } })
+	$ipcTimer.Start()
 
 	$planetTimer = New-Object System.Windows.Threading.DispatcherTimer
 	$planetTimer.Interval = [TimeSpan]::FromMilliseconds(140)
@@ -11112,6 +11960,7 @@ function Show-PowerTorrentGui {
 			return
 		}
 		try { $timer.Stop() } catch { }
+		try { $ipcTimer.Stop() } catch { }
 		try { $planetTimer.Stop() } catch { }
 		try { Save-PtActiveJobs } catch { }
 		try { Stop-AllTorrents } catch { }
