@@ -8968,6 +8968,7 @@ function Show-PowerTorrentGui {
 	<StreamGeometry x:Key="GeoGear">M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoFolder">M10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6H12L10,4Z</StreamGeometry>
 	<StreamGeometry x:Key="GeoSearch">M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L20.13,19.42L18.72,20.83L13.03,15.14C11.89,16.11 10.41,16.7 8.8,16.7C5.24,16.7 2.3,13.76 2.3,10.2C2.3,6.64 5.24,3.7 8.8,3.7M9.5,5A4.5,4.5 0 0,0 5,9.5A4.5,4.5 0 0,0 9.5,14A4.5,4.5 0 0,0 14,9.5A4.5,4.5 0 0,0 9.5,5Z</StreamGeometry>
+	<StreamGeometry x:Key="GeoHelpCircle">M11,18H13V16H11V18M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,6A4,4 0 0,0 8,10H10A2,2 0 0,1 12,8A2,2 0 0,1 14,10C14,12 11,11.75 11,15H13C13,12.75 16,12.5 16,10A4,4 0 0,0 12,6Z</StreamGeometry>
 	<SolidColorBrush x:Key="Theme.WindowBg" Color="#141A1E"/>
 	<SolidColorBrush x:Key="Theme.Text" Color="#E8F4F8"/>
 	<SolidColorBrush x:Key="Theme.Muted" Color="#A8C4CC"/>
@@ -9254,6 +9255,16 @@ function Show-PowerTorrentGui {
 	</Style>
 	<Style TargetType="TextBlock">
 	  <Setter Property="Foreground" Value="{DynamicResource Theme.Text}"/>
+	</Style>
+	<Style TargetType="Hyperlink">
+	  <Setter Property="Foreground" Value="{DynamicResource Theme.AccentHi}"/>
+	  <Setter Property="TextDecorations" Value="Underline"/>
+	  <Setter Property="Cursor" Value="Hand"/>
+	  <Style.Triggers>
+		<Trigger Property="IsMouseOver" Value="True">
+		  <Setter Property="Foreground" Value="{DynamicResource Theme.Text}"/>
+		</Trigger>
+	  </Style.Triggers>
 	</Style>
 	<Style TargetType="ListBoxItem">
 	  <Setter Property="Foreground" Value="{DynamicResource Theme.Text}"/>
@@ -9918,7 +9929,20 @@ function Show-PowerTorrentGui {
 					<TextBlock x:Name="lblVpnStatus" Foreground="{DynamicResource Theme.Muted}" FontSize="11"
 							   TextWrapping="Wrap" Text="configured" VerticalAlignment="Center"/>
 				  </DockPanel>
-				  <CheckBox x:Name="chkVpnRequire" Content="Killswitch" IsChecked="False" IsEnabled="False" Margin="0,0,0,8"/>
+				  <DockPanel Margin="0,0,0,8">
+					<Button x:Name="btnAirVpnHelp" Style="{StaticResource CaptionBtn}" DockPanel.Dock="Right"
+							Width="22" Height="22" Padding="0" Margin="4,0,0,0" Cursor="Hand"
+							ToolTip="How to generate an AirVPN config">
+					  <Path Fill="{DynamicResource Theme.Ico}" Width="16" Height="16" Stretch="Uniform"
+							Data="{StaticResource GeoHelpCircle}"/>
+					</Button>
+					<TextBlock DockPanel.Dock="Right" VerticalAlignment="Center" FontSize="11">
+					  <Hyperlink x:Name="lnkAirVpn" NavigateUri="https://airvpn.org/"
+								 ToolTip="Generate a WireGuard or OpenVPN config at AirVPN.org">AirVPN.org</Hyperlink>
+					</TextBlock>
+					<CheckBox x:Name="chkVpnRequire" Content="Killswitch" IsChecked="False" IsEnabled="False"
+							  VerticalAlignment="Center"/>
+				  </DockPanel>
 				  <Button x:Name="btnVpnImport" Style="{StaticResource DlgBtn}" HorizontalAlignment="Stretch" Margin="0,0,0,6">
 					<StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
 					  <Path Style="{StaticResource IcoOnBtn}" Data="{StaticResource GeoFolder}"/>
@@ -10296,7 +10320,7 @@ function Show-PowerTorrentGui {
 	$ui = @{}
 	foreach ($n in @(
 			'hdrBar','imgPlanet','txtSaveFlyout','btnBrowseDir','chkDht','chkEncrypt','chkUtp','chkSeq','chkSeed','chkCloseToTray',
-			'chkVpnRequire','btnVpnImport','btnVpnConnect','btnVpnStop','lblVpnStatus','lblVpnConn','lblVpnSaved','pnlVpnConfigured',
+			'chkVpnRequire','lnkAirVpn','btnAirVpnHelp','btnVpnImport','btnVpnConnect','btnVpnStop','lblVpnStatus','lblVpnConn','lblVpnSaved','pnlVpnConfigured',
 			'txtPort','txtPeers','cmbTheme','btnSaveOptions','btnAddFile','btnAddMagnet','btnPlayPause','icoPlayPause','txtPlayPause','btnStop','btnRemove',
 			'scrGeneral','pnlGeneral','lblName','lblSavePath','lblHash','lblComment','lblCreated','lblState','lblProgress','lblPieces','lblPeers','lblRatio','lblAvail','lblSpeed',
 			'txtLog','lstFiles','lstTrackers','btnRegister','btnRegisterTorrent',
@@ -10528,8 +10552,10 @@ function Show-PowerTorrentGui {
 	<Border DockPanel.Dock="Top" Background="{DynamicResource HdrFace}" Padding="12,8">
 	  <TextBlock x:Name="lblTitle" FontWeight="SemiBold"/>
 	</Border>
-	<StackPanel Margin="18,14" Width="380">
+	<StackPanel Margin="18,14" Width="420">
+	  <ScrollViewer x:Name="scrMsg" MaxHeight="420" VerticalScrollBarVisibility="Auto">
 	  <TextBlock x:Name="lblMsg" TextWrapping="Wrap" Margin="0,0,0,16"/>
+	  </ScrollViewer>
 	  <TextBlock x:Name="lblNote" TextWrapping="Wrap" Margin="0,-8,0,14" FontSize="11" FontStyle="Italic"
 				 Foreground="{DynamicResource Theme.Muted}" Visibility="Collapsed"/>
 	  <CheckBox x:Name="chkExtra" Margin="0,0,0,14" Visibility="Collapsed"/>
@@ -10784,6 +10810,41 @@ function Show-PowerTorrentGui {
 		else { Show-PtKillswitchPopup -Why Connect }
 	}
 
+	if ($ui.lnkAirVpn) {
+		$ui.lnkAirVpn.add_Click({
+			try {
+				$psi = New-Object System.Diagnostics.ProcessStartInfo
+				$psi.FileName = 'https://airvpn.org/'
+				$psi.UseShellExecute = $true
+				[void][System.Diagnostics.Process]::Start($psi)
+			} catch { }
+		})
+	}
+	if ($ui.btnAirVpnHelp) {
+		$ui.btnAirVpnHelp.add_Click({
+			$nl = [Environment]::NewLine
+			$msg = @(
+				'How to generate an AirVPN config for PowerTorrent:',
+				'',
+				'1. Create an AirVPN account.',
+				'2. Select the Client Area tab at the top of the page.',
+				'3. Select Config Generator.',
+				'4. At the top of the page, click the Advanced toggle.',
+				'5. In Advanced, on the right, set IP layer exit to IPv4 Only.',
+				'6. Select a single protocol on the left (for example WireGuard UDP 1637).',
+				'7. Scroll to By Single Server and select only one server.',
+				'8. Scroll to the bottom and click Generate. That downloads the config file.',
+				'',
+				'Then import it in PowerTorrent:',
+				'',
+				'9. Click Import .conf / .ovpn in this Options panel.',
+				'10. Choose the file AirVPN just downloaded.',
+				'11. Killswitch turns on. Click Connect if the tunnel does not start on its own.',
+				'12. Click Save options if you want this config kept after you close PowerTorrent.'
+			) -join $nl
+			Show-PtMessage -Title 'AirVPN config' -Message $msg | Out-Null
+		})
+	}
 	if ($ui.chkVpnRequire) {
 		$ui.chkVpnRequire.add_Click({
 			if ($script:PtVpnChkQuiet) { return }
