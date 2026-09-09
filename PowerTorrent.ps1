@@ -97,6 +97,10 @@
 .NOTES
 	Settings live in PowerTorrent.ini next to the script. An imported VPN
 	config stays in memory unless you save options, then it is stored in that file.
+
+	MIT License. Copyright (c) 2026 illsk1lls. Provided as-is, no warranty.
+	Follow copyright and local laws. This client does not grant permission
+	to download or share anything you are not allowed to.
 #>
 [CmdletBinding()]
 param(
@@ -8360,7 +8364,7 @@ function Show-PtNoticeGui {
 	  <TextBlock Text="PowerTorrent" FontWeight="SemiBold" FontSize="15" Margin="0,0,0,10"
 				 Foreground="{DynamicResource Theme.Text}"/>
 	  <TextBlock TextWrapping="Wrap" Margin="0,0,0,16" Foreground="{DynamicResource Theme.Text}"
-				 Text="Please follow copyright and local laws when using this BitTorrent client."/>
+				 Text="Please follow copyright and local laws. This client does not grant permission to download or share anything you are not allowed to."/>
 	  <CheckBox x:Name="chkRemember" Content="Remember this" Margin="0,0,0,16"/>
 	  <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
 		<Button x:Name="btnOk" Content="OK" Width="84" Height="28" Margin="0,0,8,0" IsDefault="True"/>
@@ -8396,7 +8400,7 @@ function Show-PtNoticeGui {
 
 function Show-PtNoticeCli {
 	Write-Host ''
-	Write-Host 'Please follow copyright and local laws when using this BitTorrent client.'
+	Write-Host 'Please follow copyright and local laws. This client does not grant permission to download or share anything you are not allowed to.'
 	Write-Host ''
 	Write-Host '  Enter / Y	 continue once'
 	Write-Host '  R			 remember this (writes a small settings file)'
