@@ -175,6 +175,7 @@ using System.Threading;
 using System.Net.Security;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using System.Runtime.InteropServices;
 
 namespace PowerTorrent {
 
@@ -2219,20 +2220,33 @@ namespace PowerTorrent {
 			}
 			h0 = hh0; h1 = hh1; h2 = hh2; h3 = hh3; h4 = hh4;
 		}
+		[ThreadStatic] static byte[] tsTail;
+		[ThreadStatic] static byte[] tsLens;
+		static byte[] Lens16() {
+			byte[] a = tsLens;
+			if (a == null) { a = new byte[16]; tsLens = a; }
+			return a;
+		}
+		static byte[] Tail16() {
+			byte[] a = tsTail;
+			if (a == null) { a = new byte[16]; tsTail = a; }
+			return a;
+		}
 		static void PolyMsg(ref uint h0, ref uint h1, ref uint h2, ref uint h3, ref uint h4,
 			uint r0, uint r1, uint r2, uint r3, uint r4, uint s1, uint s2, uint s3, uint s4,
-			byte[] m, int len) {
+			byte[] m, int off, int len) {
 			if (m == null || len <= 0) return;
 			int full = len & ~15;
-			if (full > 0) PolyBlocks(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, m, 0, full);
+			if (full > 0) PolyBlocks(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, m, off, full);
 			int left = len - full;
 			if (left > 0) {
-				byte[] p = new byte[16];
-				Buffer.BlockCopy(m, full, p, 0, left);
+				byte[] p = Tail16();
+				for (int i = 0; i < 16; i++) p[i] = 0;
+				Buffer.BlockCopy(m, off + full, p, 0, left);
 				PolyBlocks(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, p, 0, 16);
 			}
 		}
-		static void Poly(byte[] otk, byte[] ad, byte[] ct, int ctLen, byte[] tag) {
+		static void Poly(byte[] otk, byte[] ad, byte[] ct, int ctOff, int ctLen, byte[] tag) {
 			uint t0 = Le32(otk, 0), t1 = Le32(otk, 4), t2 = Le32(otk, 8), t3 = Le32(otk, 12);
 			uint r0 = t0 & 0x3ffffff;
 			uint r1 = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03;
@@ -2243,9 +2257,9 @@ namespace PowerTorrent {
 			uint p0 = Le32(otk, 16), p1 = Le32(otk, 20), p2 = Le32(otk, 24), p3 = Le32(otk, 28);
 			uint h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
 			if (ad == null) ad = NoAd;
-			PolyMsg(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, ad, ad.Length);
-			PolyMsg(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, ct, ctLen);
-			byte[] lens = new byte[16];
+			PolyMsg(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, ad, 0, ad.Length);
+			PolyMsg(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, ct, ctOff, ctLen);
+			byte[] lens = Lens16();
 			St32(lens, 0, (uint)ad.Length); St32(lens, 4, (uint)((ulong)ad.Length >> 32));
 			St32(lens, 8, (uint)ctLen); St32(lens, 12, 0);
 			PolyBlocks(ref h0, ref h1, ref h2, ref h3, ref h4, r0, r1, r2, r3, r4, s1, s2, s3, s4, lens, 0, 16);
@@ -2284,9 +2298,45 @@ namespace PowerTorrent {
 			byte[] otk = new byte[64]; Block(key, nonce, 0, S16(), W16(), otk);
 			byte[] ct = new byte[plain.Length + 16];
 			if (plain.Length > 0) XorChaCha(key, nonce, 1, plain, 0, plain.Length, ct, 0);
-			byte[] tag = new byte[16]; Poly(otk, ad, ct, plain.Length, tag);
+			byte[] tag = new byte[16]; Poly(otk, ad, ct, 0, plain.Length, tag);
 			Buffer.BlockCopy(tag, 0, ct, plain.Length, 16);
 			return ct;
+		}
+		[ThreadStatic] static byte[] tsNonce;
+		[ThreadStatic] static byte[] tsOtk;
+		[ThreadStatic] static byte[] tsTag;
+		static byte[] NonceBuf() { byte[] a = tsNonce; if (a == null) { a = new byte[12]; tsNonce = a; } return a; }
+		static byte[] OtkBuf() { byte[] a = tsOtk; if (a == null) { a = new byte[64]; tsOtk = a; } return a; }
+		static byte[] TagBuf() { byte[] a = tsTag; if (a == null) { a = new byte[16]; tsTag = a; } return a; }
+		static void StoreCounter(byte[] nonce, ulong counter) {
+			nonce[0] = 0; nonce[1] = 0; nonce[2] = 0; nonce[3] = 0;
+			St32(nonce, 4, (uint)counter); St32(nonce, 8, (uint)(counter >> 32));
+		}
+		public static int SealInto(byte[] key, ulong counter, byte[] plain, int plainOff, int plainLen, byte[] dst, int dstOff) {
+			byte[] nonce = NonceBuf();
+			StoreCounter(nonce, counter);
+			byte[] otk = OtkBuf();
+			Block(key, nonce, 0, S16(), W16(), otk);
+			if (plainLen > 0) XorChaCha(key, nonce, 1, plain, plainOff, plainLen, dst, dstOff);
+			byte[] tag = TagBuf();
+			Poly(otk, NoAd, dst, dstOff, plainLen, tag);
+			Buffer.BlockCopy(tag, 0, dst, dstOff + plainLen, 16);
+			return plainLen + 16;
+		}
+		public static bool OpenInto(byte[] key, ulong counter, byte[] cipher, int cOff, int cLen, byte[] dst, int dstOff) {
+			if (cipher == null || cLen < 16) return false;
+			int plen = cLen - 16;
+			byte[] nonce = NonceBuf();
+			StoreCounter(nonce, counter);
+			byte[] otk = OtkBuf();
+			Block(key, nonce, 0, S16(), W16(), otk);
+			byte[] tag = TagBuf();
+			Poly(otk, NoAd, cipher, cOff, plen, tag);
+			int diff = 0;
+			for (int i = 0; i < 16; i++) diff |= tag[i] ^ cipher[cOff + plen + i];
+			if (diff != 0) return false;
+			if (plen > 0) XorChaCha(key, nonce, 1, cipher, cOff, plen, dst, dstOff);
+			return true;
 		}
 		public static byte[] Open(byte[] key, ulong counter, byte[] cipher, byte[] ad) {
 			if (cipher == null || cipher.Length < 16) return null;
@@ -2294,7 +2344,7 @@ namespace PowerTorrent {
 			int plen = cipher.Length - 16;
 			byte[] nonce = Nonce(counter);
 			byte[] otk = new byte[64]; Block(key, nonce, 0, S16(), W16(), otk);
-			byte[] tag = new byte[16]; Poly(otk, ad, cipher, plen, tag);
+			byte[] tag = new byte[16]; Poly(otk, ad, cipher, 0, plen, tag);
 			int diff = 0;
 			for (int i = 0; i < 16; i++) diff |= tag[i] ^ cipher[plen + i];
 			if (diff != 0) return null;
@@ -2371,6 +2421,7 @@ namespace PowerTorrent {
 		internal byte[] data;
 		internal uint seq;
 		internal DateTime sent;
+		internal int sends;
 	}
 
 	internal sealed class VpnTcpStream : Stream {
@@ -2391,7 +2442,8 @@ namespace PowerTorrent {
 
 	internal sealed class VpnTcp {
 		internal const int Mss = 1280;
-		internal const int MaxFlight = 4096 * 1280;
+		internal const int IwSegs = 32;
+		internal const int CwndMax = 32 * 1024 * 1024;
 		internal const int WScale = 8;
 		internal uint remIp, locIp; internal ushort remPort, locPort;
 		internal int state;
@@ -2401,6 +2453,15 @@ namespace PowerTorrent {
 		internal int rxOff, rxAvail, dupAcks;
 		internal uint peerWnd = 65535;
 		internal int sndWScale;
+		internal int cwnd = Mss * IwSegs;
+		internal int ssthresh = CwndMax;
+		internal int sndMss = Mss;
+		internal int srttMs, rttvarMs, rtoMs = 250, rtoCur = 250;
+		internal bool fastRec, lossHeld;
+		internal uint recoverAt, lossUna;
+		internal int lastRawWnd = -1;
+		internal VpnSeg rexmit;
+		internal bool wantPump;
 		internal readonly Dictionary<uint, byte[]> ooo = new Dictionary<uint, byte[]>();
 		internal readonly Queue<byte[]> pending = new Queue<byte[]>();
 		internal readonly List<VpnSeg> flight = new List<VpnSeg>();
@@ -2442,12 +2503,167 @@ namespace PowerTorrent {
 			for (int i = 0; i < flight.Count; i++) n += flight[i].data.Length;
 			return n;
 		}
+		internal void NoteRtt(int sampleMs) {
+			if (sampleMs < 1) sampleMs = 1;
+			if (sampleMs > 10000) sampleMs = 10000;
+			if (srttMs == 0) {
+				srttMs = sampleMs;
+				rttvarMs = sampleMs / 2;
+			} else {
+				int delta = sampleMs - srttMs;
+				if (delta < 0) delta = -delta;
+				rttvarMs = (3 * rttvarMs + delta) / 4;
+				srttMs = (7 * srttMs + sampleMs) / 8;
+			}
+			int r = srttMs + 4 * rttvarMs;
+			if (r < 50) r = 50;
+			if (r > 3000) r = 3000;
+			rtoMs = r;
+			rtoCur = r;
+		}
+		internal void OnNewAck(int acked) {
+			if (acked < 1) return;
+			if (cwnd < ssthresh) {
+				int add = acked;
+				if (add > 2 * Mss) add = 2 * Mss;
+				cwnd += add;
+			} else {
+				int inc = (Mss * Mss) / cwnd;
+				if (inc < 1) inc = 1;
+				cwnd += inc;
+			}
+			if (cwnd > CwndMax) cwnd = CwndMax;
+			if (cwnd < Mss) cwnd = Mss;
+		}
+		internal int FlightCap() {
+			int cap = cwnd;
+			if (cap > CwndMax) cap = CwndMax;
+			if (cap < Mss) cap = Mss;
+			if (peerWnd > 16384 && peerWnd < (uint)cap) cap = (int)peerWnd;
+			return cap;
+		}
+		internal void NotePeerMss(int peerMss) {
+			int ours = VpnHub.SegMss();
+			int m = peerMss;
+			if (m < 536) m = 536;
+			if (m > ours) m = ours;
+			if (m > 1440) m = 1440;
+			sndMss = m;
+		}
+		internal void EnterFastRecovery(int flightBytes, uint sndNxtNow) {
+			fastRec = true;
+			recoverAt = sndNxtNow;
+			int half = flightBytes / 2;
+			if (half < 2 * Mss) half = 2 * Mss;
+			ssthresh = half;
+			if (ssthresh > CwndMax) ssthresh = CwndMax;
+			cwnd = ssthresh + 3 * Mss;
+			if (cwnd > CwndMax) cwnd = CwndMax;
+			dupAcks = 0;
+		}
+		internal void CutOnTimeout(int flightBytes) {
+			int half = flightBytes / 2;
+			if (half < 2 * Mss) half = 2 * Mss;
+			ssthresh = half;
+			if (ssthresh > CwndMax) ssthresh = CwndMax;
+			cwnd = Mss;
+			fastRec = false;
+			dupAcks = 0;
+		}
+		internal void OnCumulativeAck(uint ack, bool countDup) {
+			rexmit = null;
+			wantPump = false;
+			uint unaBefore = sndUna;
+			int rttSample = -1;
+			while (flight.Count > 0) {
+				VpnSeg sg = flight[0];
+				uint end = sg.seq + (uint)sg.data.Length;
+				if (ack >= end) {
+					if (sg.sends == 1) {
+						int ms = (int)(DateTime.UtcNow - sg.sent).TotalMilliseconds;
+						if (ms < 0) ms = 0;
+						rttSample = ms;
+					}
+					flight.RemoveAt(0);
+					sndUna = end;
+				} else break;
+			}
+			if (sndUna != unaBefore) {
+				if (rttSample >= 0) NoteRtt(rttSample);
+				ev.Set();
+				int acked = (int)(sndUna - unaBefore);
+				rtoCur = rtoMs;
+				lossHeld = false;
+				if (fastRec) {
+					if (ack >= recoverAt) {
+						fastRec = false;
+						dupAcks = 0;
+						cwnd = ssthresh;
+						if (cwnd < Mss) cwnd = Mss;
+						if (cwnd > CwndMax) cwnd = CwndMax;
+					} else {
+						dupAcks = 0;
+						cwnd = ssthresh;
+						if (cwnd < Mss) cwnd = Mss;
+						if (flight.Count > 0) {
+							flight[0].sent = DateTime.UtcNow;
+							flight[0].sends++;
+							rexmit = flight[0];
+						}
+					}
+				} else {
+					dupAcks = 0;
+					OnNewAck(acked);
+				}
+				wantPump = true;
+				return;
+			}
+			if (countDup && flight.Count > 0 && ack == sndUna) {
+				dupAcks++;
+				if (!fastRec && dupAcks >= 3) {
+					int fb = 0;
+					for (int i = 0; i < flight.Count; i++) fb += flight[i].data.Length;
+					EnterFastRecovery(fb, sndNxt);
+					flight[0].sent = DateTime.UtcNow;
+					flight[0].sends++;
+					rexmit = flight[0];
+				} else if (fastRec) {
+					cwnd += Mss;
+					if (cwnd > CwndMax) cwnd = CwndMax;
+					wantPump = true;
+				}
+			}
+		}
+		internal bool OnRetransmitTimeout(DateTime now) {
+			rexmit = null;
+			if (state != 3 || flight.Count == 0) return false;
+			if ((now - flight[0].sent).TotalMilliseconds < rtoCur) return false;
+			if (!lossHeld || lossUna != sndUna) {
+				int fb = 0;
+				for (int i = 0; i < flight.Count; i++) fb += flight[i].data.Length;
+				CutOnTimeout(fb);
+				recoverAt = sndNxt;
+				lossHeld = true;
+				lossUna = sndUna;
+			}
+			int nb = rtoCur * 2;
+			if (nb < 50) nb = 50;
+			if (nb > 3000) nb = 3000;
+			rtoCur = nb;
+			flight[0].sent = now;
+			flight[0].sends++;
+			rexmit = flight[0];
+			return true;
+		}
 		public void Write(byte[] b, int o, int n) {
 			if (n <= 0 || state != 3) return;
+			int mss = sndMss;
+			if (mss < 536) mss = 536;
+			if (mss > 1440) mss = 1440;
 			int off = 0;
 			lock (gate) {
 				while (off < n) {
-					int take = n - off; if (take > Mss) take = Mss;
+					int take = n - off; if (take > mss) take = mss;
 					byte[] seg = new byte[take];
 					Buffer.BlockCopy(b, o + off, seg, 0, take);
 					pending.Enqueue(seg);
@@ -2594,21 +2810,213 @@ namespace PowerTorrent {
 			Xor16(y, len, 0); GfMul(y, H);
 			Buffer.BlockCopy(y, 0, out16, 0, 16);
 		}
+		[StructLayout(LayoutKind.Sequential)]
+		struct GcmAuth {
+			public uint cbSize;
+			public uint dwInfoVersion;
+			public IntPtr pbNonce;
+			public uint cbNonce;
+			public IntPtr pbAuthData;
+			public uint cbAuthData;
+			public IntPtr pbTag;
+			public uint cbTag;
+			public IntPtr pbMacContext;
+			public uint cbMacContext;
+			public uint cbAAD;
+			public ulong cbData;
+			public uint dwFlags;
+		}
+		sealed class GcmSlot {
+			public byte[] key;
+			public byte[] obj;
+			public GCHandle pin;
+			public IntPtr hKey;
+		}
+		static readonly object gcmGate = new object();
+		static readonly byte[] gcmDummy = new byte[1];
+		static IntPtr gcmAlg;
+		static int gcmObjLen;
+		static GcmSlot gcmA, gcmB;
+		static int gcmUse;
+		public static int CngHits;
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptOpenAlgorithmProvider(out IntPtr phAlgorithm, [MarshalAs(UnmanagedType.LPWStr)] string pszAlgId, [MarshalAs(UnmanagedType.LPWStr)] string pszImplementation, uint dwFlags);
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptCloseAlgorithmProvider(IntPtr hAlgorithm, uint dwFlags);
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptSetProperty(IntPtr hObject, [MarshalAs(UnmanagedType.LPWStr)] string pszProperty, byte[] pbInput, int cbInput, uint dwFlags);
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptGetProperty(IntPtr hObject, [MarshalAs(UnmanagedType.LPWStr)] string pszProperty, byte[] pbOutput, int cbOutput, out int pcbResult, uint dwFlags);
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptGenerateSymmetricKey(IntPtr hAlgorithm, out IntPtr phKey, byte[] pbKeyObject, int cbKeyObject, byte[] pbSecret, int cbSecret, uint dwFlags);
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptDestroyKey(IntPtr hKey);
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptEncrypt(IntPtr hKey, byte[] pbInput, int cbInput, ref GcmAuth pInfo, IntPtr pbIV, int cbIV, byte[] pbOutput, int cbOutput, out int pcbResult, uint dwFlags);
+		[DllImport("bcrypt.dll")]
+		static extern uint BCryptDecrypt(IntPtr hKey, byte[] pbInput, int cbInput, ref GcmAuth pInfo, IntPtr pbIV, int cbIV, byte[] pbOutput, int cbOutput, out int pcbResult, uint dwFlags);
+		static bool GcmReady() {
+			if (gcmAlg != IntPtr.Zero) return gcmObjLen > 0;
+			IntPtr h;
+			uint st = BCryptOpenAlgorithmProvider(out h, "AES", "Microsoft Primitive Provider", 0);
+			if (st != 0) st = BCryptOpenAlgorithmProvider(out h, "AES", null, 0);
+			if (st != 0) return false;
+			byte[] mode = Encoding.Unicode.GetBytes("ChainingModeGCM\0");
+			st = BCryptSetProperty(h, "ChainingMode", mode, mode.Length, 0);
+			if (st != 0) { BCryptCloseAlgorithmProvider(h, 0); return false; }
+			byte[] lenBuf = new byte[4];
+			int got;
+			st = BCryptGetProperty(h, "ObjectLength", lenBuf, 4, out got, 0);
+			if (st != 0 || got < 4) { BCryptCloseAlgorithmProvider(h, 0); return false; }
+			int objLen = BitConverter.ToInt32(lenBuf, 0);
+			if (objLen < 16) { BCryptCloseAlgorithmProvider(h, 0); return false; }
+			gcmAlg = h; gcmObjLen = objLen;
+			return true;
+		}
+		static bool SameKey(GcmSlot s, byte[] key) {
+			if (s == null || s.key == null || key == null || s.key.Length != key.Length) return false;
+			int d = 0;
+			for (int i = 0; i < key.Length; i++) d |= s.key[i] ^ key[i];
+			return d == 0;
+		}
+		static void FreeSlot(GcmSlot s) {
+			if (s == null) return;
+			if (s.hKey != IntPtr.Zero) { try { BCryptDestroyKey(s.hKey); } catch { } s.hKey = IntPtr.Zero; }
+			if (s.pin.IsAllocated) s.pin.Free();
+		}
+		static GcmSlot ImportGcm(byte[] key) {
+			byte[] obj = new byte[gcmObjLen];
+			GCHandle pin = GCHandle.Alloc(obj, GCHandleType.Pinned);
+			IntPtr hk;
+			uint st = BCryptGenerateSymmetricKey(gcmAlg, out hk, obj, obj.Length, key, key.Length, 0);
+			if (st != 0 || hk == IntPtr.Zero) { pin.Free(); return null; }
+			GcmSlot s = new GcmSlot();
+			s.key = new byte[key.Length];
+			Buffer.BlockCopy(key, 0, s.key, 0, key.Length);
+			s.obj = obj; s.pin = pin; s.hKey = hk;
+			return s;
+		}
+		static GcmSlot SlotFor(byte[] key) {
+			if (key == null || key.Length == 0 || !GcmReady()) return null;
+			if (SameKey(gcmA, key)) { gcmUse = 0; return gcmA; }
+			if (SameKey(gcmB, key)) { gcmUse = 1; return gcmB; }
+			GcmSlot neu = ImportGcm(key);
+			if (neu == null) return null;
+			if (gcmA == null) { gcmA = neu; gcmUse = 0; return neu; }
+			if (gcmB == null) { gcmB = neu; gcmUse = 1; return neu; }
+			if (gcmUse == 0) { FreeSlot(gcmB); gcmB = neu; gcmUse = 1; }
+			else { FreeSlot(gcmA); gcmA = neu; gcmUse = 0; }
+			return neu;
+		}
+		static GcmAuth AuthInfo(IntPtr nonce, int nlen, IntPtr ad, int adlen, IntPtr tag) {
+			GcmAuth info = new GcmAuth();
+			info.cbSize = (uint)Marshal.SizeOf(typeof(GcmAuth));
+			info.dwInfoVersion = 1;
+			info.pbNonce = nonce;
+			info.cbNonce = (uint)nlen;
+			info.pbAuthData = ad;
+			info.cbAuthData = (uint)adlen;
+			info.pbTag = tag;
+			info.cbTag = 16;
+			return info;
+		}
+		static byte[] SealGcm(byte[] key, byte[] nonce, byte[] ad, byte[] pt, int ptOff, int ptLen) {
+			if (key == null || nonce == null || nonce.Length != 12 || ptLen < 0) return null;
+			if (pt == null) { pt = gcmDummy; ptOff = 0; ptLen = 0; }
+			if (ad != null && ad.Length == 0) ad = null;
+			if (ptOff != 0 && ptLen > 0) {
+				byte[] slice = new byte[ptLen];
+				Buffer.BlockCopy(pt, ptOff, slice, 0, ptLen);
+				pt = slice; ptOff = 0;
+			}
+			lock (gcmGate) {
+				GcmSlot slot = SlotFor(key);
+				if (slot == null) return null;
+				byte[] tag = new byte[16];
+				byte[] ct = ptLen > 0 ? new byte[ptLen] : gcmDummy;
+				GCHandle hn = GCHandle.Alloc(nonce, GCHandleType.Pinned);
+				GCHandle ht = GCHandle.Alloc(tag, GCHandleType.Pinned);
+				GCHandle ha = default(GCHandle);
+				if (ad != null) ha = GCHandle.Alloc(ad, GCHandleType.Pinned);
+				try {
+					GcmAuth info = AuthInfo(hn.AddrOfPinnedObject(), nonce.Length, ad != null ? ha.AddrOfPinnedObject() : IntPtr.Zero, ad != null ? ad.Length : 0, ht.AddrOfPinnedObject());
+					int written;
+					byte[] input = ptLen > 0 ? pt : gcmDummy;
+					uint st = BCryptEncrypt(slot.hKey, input, ptLen, ref info, IntPtr.Zero, 0, ct, ptLen, out written, 0);
+					if (st != 0) return null;
+					if (ptLen > 0 && written != ptLen) return null;
+					byte[] o = new byte[ptLen + 16];
+					if (ptLen > 0) Buffer.BlockCopy(ct, 0, o, 0, ptLen);
+					Buffer.BlockCopy(tag, 0, o, ptLen, 16);
+					CngHits++;
+					return o;
+				} finally {
+					hn.Free(); ht.Free();
+					if (ha.IsAllocated) ha.Free();
+				}
+			}
+		}
+		static byte[] OpenGcm(byte[] key, byte[] nonce, byte[] ad, byte[] ctTag) {
+			if (key == null || nonce == null || nonce.Length != 12 || ctTag == null || ctTag.Length < 16) return null;
+			if (ad != null && ad.Length == 0) ad = null;
+			int plen = ctTag.Length - 16;
+			lock (gcmGate) {
+				GcmSlot slot = SlotFor(key);
+				if (slot == null) return null;
+				byte[] ct = plen > 0 ? new byte[plen] : gcmDummy;
+				if (plen > 0) Buffer.BlockCopy(ctTag, 0, ct, 0, plen);
+				byte[] tag = new byte[16];
+				Buffer.BlockCopy(ctTag, plen, tag, 0, 16);
+				byte[] pt = plen > 0 ? new byte[plen] : gcmDummy;
+				GCHandle hn = GCHandle.Alloc(nonce, GCHandleType.Pinned);
+				GCHandle ht = GCHandle.Alloc(tag, GCHandleType.Pinned);
+				GCHandle ha = default(GCHandle);
+				if (ad != null) ha = GCHandle.Alloc(ad, GCHandleType.Pinned);
+				try {
+					GcmAuth info = AuthInfo(hn.AddrOfPinnedObject(), nonce.Length, ad != null ? ha.AddrOfPinnedObject() : IntPtr.Zero, ad != null ? ad.Length : 0, ht.AddrOfPinnedObject());
+					int written;
+					uint st = BCryptDecrypt(slot.hKey, ct, plen, ref info, IntPtr.Zero, 0, pt, plen, out written, 0);
+					if (st != 0) return null;
+					if (plen > 0 && written != plen) return null;
+					CngHits++;
+					if (plen == 0) return new byte[0];
+					return pt;
+				} finally {
+					hn.Free(); ht.Free();
+					if (ha.IsAllocated) ha.Free();
+				}
+			}
+		}
 		public static byte[] Seal(byte[] key, byte[] nonce12, byte[] ad, byte[] pt) {
 			if (pt == null) pt = new byte[0];
+			return Seal(key, nonce12, ad, pt, 0, pt.Length);
+		}
+		public static byte[] Seal(byte[] key, byte[] nonce12, byte[] ad, byte[] pt, int ptOff, int ptLen) {
+			byte[] fast = SealGcm(key, nonce12, ad, pt, ptOff, ptLen);
+			if (fast != null) return fast;
+			return SealManaged(key, nonce12, ad, pt, ptOff, ptLen);
+		}
+		static byte[] SealManaged(byte[] key, byte[] nonce12, byte[] ad, byte[] pt, int ptOff, int ptLen) {
+			if (pt == null) { pt = new byte[0]; ptOff = 0; ptLen = 0; }
 			if (ad == null) ad = new byte[0];
+			if (ptLen < 0) ptLen = 0;
 			Aes aes; ICryptoTransform enc = AesEnc(key, out aes);
 			try {
 				byte[] H = new byte[16]; AesEcb(enc, H);
-				byte[] ct = new byte[pt.Length + 16];
-				Ctr(enc, nonce12, 2, pt, 0, pt.Length, ct, 0);
-				byte[] s = new byte[16]; Ghash(H, ad, ct, pt.Length, s);
+				byte[] ct = new byte[ptLen + 16];
+				if (ptLen > 0) Ctr(enc, nonce12, 2, pt, ptOff, ptLen, ct, 0);
+				byte[] s = new byte[16]; Ghash(H, ad, ct, ptLen, s);
 				byte[] t0 = new byte[16]; Ctr(enc, nonce12, 1, s, 0, 16, t0, 0);
-				Buffer.BlockCopy(t0, 0, ct, pt.Length, 16);
+				Buffer.BlockCopy(t0, 0, ct, ptLen, 16);
 				return ct;
 			} finally { enc.Dispose(); aes.Dispose(); }
 		}
 		public static byte[] Open(byte[] key, byte[] nonce12, byte[] ad, byte[] ctTag) {
+			byte[] fast = OpenGcm(key, nonce12, ad, ctTag);
+			if (fast != null) return fast;
+			return OpenManaged(key, nonce12, ad, ctTag);
+		}
+		static byte[] OpenManaged(byte[] key, byte[] nonce12, byte[] ad, byte[] ctTag) {
 			if (ctTag == null || ctTag.Length < 16) return null;
 			if (ad == null) ad = new byte[0];
 			int plen = ctTag.Length - 16;
@@ -3290,7 +3698,10 @@ namespace PowerTorrent {
 			VpnHub.OnInnerIp(inner);
 		}
 		public void SendInner(byte[] inner) {
-			if (!keysUp || sendCk == null) return;
+			SendInner(inner, inner == null ? 0 : inner.Length);
+		}
+		public void SendInner(byte[] inner, int len) {
+			if (!keysUp || sendCk == null || inner == null || len <= 0) return;
 			uint pid;
 			lock (gate) { pid = dataPid++; }
 			byte[] nonce = new byte[12];
@@ -3304,7 +3715,7 @@ namespace PowerTorrent {
 			byte[] ad = new byte[8];
 			Buffer.BlockCopy(hdr, 0, ad, 0, 4);
 			Be32(ad, 4, pid);
-			byte[] sealedB = AesGcmPt.Seal(sendCk, nonce, ad, inner);
+			byte[] sealedB = AesGcmPt.Seal(sendCk, nonce, ad, inner, 0, len);
 			byte[] pkt = new byte[8 + sealedB.Length];
 			Buffer.BlockCopy(hdr, 0, pkt, 0, 4);
 			Be32(pkt, 4, pid);
@@ -3375,6 +3786,10 @@ namespace PowerTorrent {
 		static byte[] hsCk, hsHash, ephPriv, ephPub, staticPub;
 		static readonly object gate = new object();
 		static readonly object udpGate = new object();
+		static readonly byte[] NoPay = new byte[0];
+		[ThreadStatic] static byte[] tsIp;
+		[ThreadStatic] static byte[] tsWg;
+		[ThreadStatic] static byte[] tsPlain;
 		static readonly Dictionary<string, VpnTcp> tcps = new Dictionary<string, VpnTcp>();
 		static readonly Dictionary<int, VpnUdpSock> udps = new Dictionary<int, VpnUdpSock>();
 		static readonly Queue<VpnTcp> accepts = new Queue<VpnTcp>();
@@ -3389,6 +3804,32 @@ namespace PowerTorrent {
 		public static bool Blocked { get { return Require && HasConfig && !up; } }
 		public static bool OsAllowed { get { return !(Require && HasConfig); } }
 		public static int Mtu { get { return mtu; } }
+		internal static int SegMss() {
+			int m = mtu - 40;
+			if (m < 536) m = 536;
+			if (m > 1440) m = 1440;
+			return m;
+		}
+		static byte[] GrowBuf(ref byte[] slot, int n) {
+			byte[] a = slot;
+			if (a == null || a.Length < n) {
+				int sz = 2048;
+				while (sz < n) sz *= 2;
+				a = new byte[sz];
+				slot = a;
+			}
+			return a;
+		}
+		static byte[] IpBuf(int n) { return GrowBuf(ref tsIp, n); }
+		static byte[] WgBuf(int n) { return GrowBuf(ref tsWg, n); }
+		static byte[] PlainBuf(int n) { return GrowBuf(ref tsPlain, n < 1 ? 1 : n); }
+		static void ArmMss(VpnTcp t, byte[] ip, int ihl, int doff) {
+			int ours = SegMss();
+			if (ours > VpnTcp.Mss) ours = VpnTcp.Mss;
+			t.sndMss = ours;
+			int pm = ParseMss(ip, ihl, doff);
+			if (pm > 0) t.NotePeerMss(pm);
+		}
 		public static string LocalAddress {
 			get { return localIp == 0 ? "" : string.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}.{3}", (localIp >> 24) & 255, (localIp >> 16) & 255, (localIp >> 8) & 255, localIp & 255); }
 		}
@@ -3447,6 +3888,26 @@ namespace PowerTorrent {
 			if (gop == null || gop.Length != gpt.Length) return "gcm-rt";
 			for (int i = 0; i < gpt.Length; i++) if (gop[i] != gpt[i]) return "gcm-pt";
 			if (AesGcmPt.Open(gk, gn, Encoding.ASCII.GetBytes("xx"), gse) != null) return "gcm-ad";
+			int hits = AesGcmPt.CngHits;
+			byte[] gcm2 = AesGcmPt.Seal(gk, gn, new byte[0], new byte[0]);
+			if (AesGcmPt.CngHits == hits || gcm2 == null) return "gcm-cng-seal";
+			hits = AesGcmPt.CngHits;
+			byte[] gopen2 = AesGcmPt.Open(gk, gn, new byte[0], gcm2);
+			if (AesGcmPt.CngHits == hits || gopen2 == null) return "gcm-cng-open";
+			byte[] noAd = ChaChaPoly.Seal(k, 7, pt, null);
+			byte[] into = new byte[pt.Length + 16];
+			int intoN = ChaChaPoly.SealInto(k, 7, pt, 0, pt.Length, into, 0);
+			if (noAd == null || intoN != noAd.Length) return "aead-into-len";
+			for (int i = 0; i < intoN; i++) if (into[i] != noAd[i]) return "aead-into";
+			byte[] inplace = new byte[pt.Length + 16];
+			Buffer.BlockCopy(pt, 0, inplace, 0, pt.Length);
+			ChaChaPoly.SealInto(k, 7, inplace, 0, pt.Length, inplace, 0);
+			for (int i = 0; i < intoN; i++) if (inplace[i] != noAd[i]) return "aead-inplace";
+			byte[] back = new byte[pt.Length + 8];
+			if (!ChaChaPoly.OpenInto(k, 7, into, 0, intoN, back, 3)) return "aead-openinto";
+			for (int i = 0; i < pt.Length; i++) if (back[3 + i] != pt[i]) return "aead-openinto-pt";
+			string cc = TcpCcSelfCheck();
+			if (cc != null) return cc;
 			return null;
 		}
 
@@ -3549,7 +4010,7 @@ namespace PowerTorrent {
 					ovpn = parsed; endpoint = parsed.Endpoint;
 				}
 				udp = new UdpClient(0, AddressFamily.InterNetwork);
-				udp.Client.ReceiveTimeout = 200;
+				udp.Client.ReceiveTimeout = 50;
 				TuneUdp(udp);
 				run = true; up = false;
 				DroppedWhileUp = false;
@@ -3704,27 +4165,30 @@ namespace PowerTorrent {
 			lock (gate) udps.Remove(s.locPort);
 		}
 		internal static void UdpSend(VpnUdpSock s, byte[] data, IPEndPoint ep) {
+			if (data == null) data = NoPay;
 			uint dip = IpToU(ep.Address);
-			byte[] pkt = BuildUdp(localIp, s.locPort, dip, (ushort)ep.Port, data);
-			SendInner(pkt);
+			byte[] pkt = IpBuf(28 + data.Length);
+			int n = FillUdp(pkt, localIp, s.locPort, dip, (ushort)ep.Port, data);
+			SendInner(pkt, n);
 		}
 		internal static void TcpSend(VpnTcp t, int flags, byte[] payload, uint seq) {
-			if (payload == null) payload = new byte[0];
-			byte[] pkt = BuildTcp(t.locIp, t.locPort, t.remIp, t.remPort, seq, t.rcvNxt, flags, payload);
-			t.lastTx = DateTime.UtcNow; SendInner(pkt);
+			if (payload == null) payload = NoPay;
+			byte[] pkt = IpBuf(48 + payload.Length);
+			int n = FillTcp(pkt, t.locIp, t.locPort, t.remIp, t.remPort, seq, t.rcvNxt, flags, payload);
+			t.lastTx = DateTime.UtcNow;
+			SendInner(pkt, n);
 		}
 		internal static void TcpPump(VpnTcp t) {
 			if (t.state != 3) return;
 			List<VpnSeg> toSend = new List<VpnSeg>();
 			lock (t.gate) {
-				int cap = VpnTcp.MaxFlight;
-				if (t.peerWnd > 16384 && t.peerWnd < (uint)cap) cap = (int)t.peerWnd;
+				int cap = t.FlightCap();
 				int flightBytes = 0;
 				for (int i = 0; i < t.flight.Count; i++) flightBytes += t.flight[i].data.Length;
 				while (t.pending.Count > 0 && flightBytes < cap) {
 					byte[] seg = t.pending.Dequeue();
 					VpnSeg s = new VpnSeg();
-					s.data = seg; s.seq = t.sndNxt; s.sent = DateTime.UtcNow;
+					s.data = seg; s.seq = t.sndNxt; s.sent = DateTime.UtcNow; s.sends = 1;
 					t.sndNxt += (uint)seg.Length;
 					t.flight.Add(s);
 					flightBytes += seg.Length;
@@ -4152,22 +4616,28 @@ namespace PowerTorrent {
 			uint recvIdx = BitConverter.ToUInt32(pkt, 4);
 			if (recvIdx != localIndex) return;
 			ulong ctr = BitConverter.ToUInt64(pkt, 8);
-			byte[] body = new byte[pkt.Length - 16]; Buffer.BlockCopy(pkt, 16, body, 0, body.Length);
-			byte[] inner = ChaChaPoly.Open(recvKey, ctr, body, null);
-			if (inner == null) return;
+			int cLen = pkt.Length - 16;
+			if (cLen < 16) return;
+			int plen = cLen - 16;
+			byte[] plain = PlainBuf(plen);
+			if (!ChaChaPoly.OpenInto(recvKey, ctr, pkt, 16, cLen, plain, 0)) return;
 			if (ctr + 1 > recvCtr) recvCtr = ctr + 1;
-			OnInnerIp(inner);
+			OnInnerIp(plain, plen);
 		}
 
 		internal static void OnInnerIp(byte[] inner) {
+			if (inner == null) return;
+			OnInnerIp(inner, inner.Length);
+		}
+		internal static void OnInnerIp(byte[] inner, int len) {
 			lastData = DateTime.UtcNow; lastRecv = DateTime.UtcNow;
-			if (inner == null || inner.Length < 20) return;
+			if (inner == null || len < 20 || inner.Length < len) return;
 			if ((inner[0] >> 4) != 4) return;
 			int ihl = (inner[0] & 0xF) * 4;
-			if (ihl < 20 || inner.Length < ihl) return;
+			if (ihl < 20 || len < ihl) return;
 			int proto = inner[9];
 			uint src = ((uint)inner[12] << 24) | ((uint)inner[13] << 16) | ((uint)inner[14] << 8) | inner[15];
-			int tot = (inner[2] << 8) | inner[3]; if (tot > inner.Length) tot = inner.Length;
+			int tot = (inner[2] << 8) | inner[3]; if (tot > len) tot = len; if (tot < ihl) return;
 			if (proto == 17 && tot >= ihl + 8) {
 				int sp = (inner[ihl] << 8) | inner[ihl + 1];
 				int dp = (inner[ihl + 2] << 8) | inner[ihl + 3];
@@ -4199,6 +4669,7 @@ namespace PowerTorrent {
 					t = new VpnTcp(); t.locIp = localIp; t.remIp = src; t.locPort = (ushort)dp; t.remPort = (ushort)sp;
 					t.rcvNxt = seq + 1; t.iss = (uint)new Random().Next(); t.sndNxt = t.iss + 1; t.sndUna = t.iss + 1; t.state = 2;
 					t.sndWScale = ParseWScale(ip, ihl, doff);
+					ArmMss(t, ip, ihl, doff);
 					int rw = (ip[ihl + 14] << 8) | ip[ihl + 15]; t.peerWnd = (uint)rw;
 					lock (gate) tcps[k] = t;
 					TcpSend(t, 0x12, null, t.iss);
@@ -4212,8 +4683,11 @@ namespace PowerTorrent {
 			lock (t.gate) {
 				if ((flags & 4) != 0) { t.rst = true; t.state = 0; t.ev.Set(); return; }
 				int rawW = (ip[ihl + 14] << 8) | ip[ihl + 15];
+				bool countDup = t.lastRawWnd == rawW && payLen == 0 && (flags & 2) == 0;
+				t.lastRawWnd = rawW;
 				if ((flags & 2) != 0) {
 					t.sndWScale = ParseWScale(ip, ihl, doff);
+					ArmMss(t, ip, ihl, doff);
 					t.peerWnd = (uint)rawW;
 				} else if (t.sndWScale > 0) t.peerWnd = ((uint)rawW) << t.sndWScale;
 				else t.peerWnd = (uint)rawW;
@@ -4221,19 +4695,9 @@ namespace PowerTorrent {
 					t.rcvNxt = seq + 1; t.state = 3; t.sndUna = t.iss + 1; sendSynAckAck = true;
 				}
 				if ((flags & 16) != 0) {
-					bool progressed = false;
-					int before = t.flight.Count;
-					while (t.flight.Count > 0) {
-						VpnSeg sg = t.flight[0];
-						uint end = sg.seq + (uint)sg.data.Length;
-						if (ack >= end) { t.flight.RemoveAt(0); t.sndUna = end; progressed = true; }
-						else break;
-					}
-					if (progressed) { t.dupAcks = 0; t.ev.Set(); pump = true; }
-					else if (before > 0 && t.flight.Count > 0) {
-						t.dupAcks++;
-						if (t.dupAcks >= 3) { t.dupAcks = 0; t.flight[0].sent = DateTime.UtcNow; fastRt = t.flight[0]; }
-					}
+					t.OnCumulativeAck(ack, countDup);
+					if (t.rexmit != null) fastRt = t.rexmit;
+					if (t.wantPump) pump = true;
 					if (t.state == 2 && (flags & 2) == 0) {
 						t.state = 3; lock (gate) accepts.Enqueue(t); acceptEv.Set();
 					}
@@ -4289,9 +4753,7 @@ namespace PowerTorrent {
 				VpnTcp t = list[i];
 				VpnSeg oldest = null;
 				lock (t.gate) {
-					if (t.flight.Count > 0 && (now - t.flight[0].sent).TotalMilliseconds > 250) {
-						t.flight[0].sent = now; oldest = t.flight[0];
-					}
+					if (t.OnRetransmitTimeout(now)) oldest = t.rexmit;
 				}
 				if (oldest != null) TcpSend(t, 0x18, oldest.data, oldest.seq);
 				TcpPump(t);
@@ -4299,57 +4761,72 @@ namespace PowerTorrent {
 		}
 
 		internal static void UdpSendRaw(byte[] msg) {
+			if (msg == null) return;
+			UdpSendRaw(msg, msg.Length);
+		}
+		static void UdpSendRaw(byte[] msg, int len) {
 			UdpClient u = udp;
 			IPEndPoint ep = endpoint;
-			if (u == null || ep == null) return;
+			if (u == null || ep == null || msg == null || len <= 0) return;
 			lock (udpGate) {
-				try { u.Send(msg, msg.Length, ep); } catch { }
+				try { u.Send(msg, len, ep); } catch { }
 			}
 		}
 
 		static void SendInner(byte[] inner) {
-			if (!up) return;
+			if (inner == null) return;
+			SendInner(inner, inner.Length);
+		}
+		static void SendInner(byte[] inner, int len) {
+			if (!up || inner == null || len <= 0) return;
 			if (vpnKind == 2) {
 				OvpnSess o = ovpn;
-				if (o != null) o.SendInner(inner);
+				if (o != null) o.SendInner(inner, len);
 				lastData = DateTime.UtcNow;
 				return;
 			}
-			WgSend(inner);
+			WgSend(inner, len);
 		}
 
 		static void WgSend(byte[] inner) {
-			if (sendKey == null || udp == null) return;
-			int pad = (16 - (inner.Length % 16)) % 16;
-			byte[] plain = new byte[inner.Length + pad];
-			Buffer.BlockCopy(inner, 0, plain, 0, inner.Length);
+			if (inner == null) return;
+			WgSend(inner, inner.Length);
+		}
+		static void WgSend(byte[] inner, int len) {
+			if (sendKey == null || udp == null || inner == null || len < 0) return;
+			int pad = (16 - (len % 16)) % 16;
+			int plainLen = len + pad;
+			int msgLen = 16 + plainLen + 16;
+			byte[] msg = WgBuf(msgLen);
+			if (len > 0) Buffer.BlockCopy(inner, 0, msg, 16, len);
+			for (int i = 0; i < pad; i++) msg[16 + len + i] = 0;
 			ulong ctr; uint ridx;
 			lock (gate) { ctr = sendCtr++; ridx = remoteIndex; }
-			byte[] enc = ChaChaPoly.Seal(sendKey, ctr, plain, null);
-			byte[] msg = new byte[16 + enc.Length];
-			BitConverter.GetBytes((uint)4).CopyTo(msg, 0);
-			BitConverter.GetBytes(ridx).CopyTo(msg, 4);
-			BitConverter.GetBytes(ctr).CopyTo(msg, 8);
-			Buffer.BlockCopy(enc, 0, msg, 16, enc.Length);
-			UdpSendRaw(msg);
+			ChaChaPoly.SealInto(sendKey, ctr, msg, 16, plainLen, msg, 16);
+			msg[0] = 4; msg[1] = 0; msg[2] = 0; msg[3] = 0;
+			msg[4] = (byte)ridx; msg[5] = (byte)(ridx >> 8); msg[6] = (byte)(ridx >> 16); msg[7] = (byte)(ridx >> 24);
+			msg[8] = (byte)ctr; msg[9] = (byte)(ctr >> 8); msg[10] = (byte)(ctr >> 16); msg[11] = (byte)(ctr >> 24);
+			msg[12] = (byte)(ctr >> 32); msg[13] = (byte)(ctr >> 40); msg[14] = (byte)(ctr >> 48); msg[15] = (byte)(ctr >> 56);
+			UdpSendRaw(msg, msgLen);
 			lastData = DateTime.UtcNow;
 		}
 
-		static byte[] BuildUdp(uint sip, ushort sp, uint dip, ushort dp, byte[] data) {
+		static int FillUdp(byte[] p, uint sip, ushort sp, uint dip, ushort dp, byte[] data) {
+			if (data == null) data = NoPay;
 			int ul = 8 + data.Length;
-			byte[] p = new byte[20 + ul];
-			p[0] = 0x45; p[2] = (byte)(p.Length >> 8); p[3] = (byte)p.Length;
+			int tot = 20 + ul;
+			p[0] = 0x45; p[1] = 0; p[2] = (byte)(tot >> 8); p[3] = (byte)tot;
 			uint id = ++ipId; p[4] = (byte)(id >> 8); p[5] = (byte)id;
-			p[8] = 64; p[9] = 17;
+			p[6] = 0; p[7] = 0; p[8] = 64; p[9] = 17; p[10] = 0; p[11] = 0;
 			PutIp(p, 12, sip); PutIp(p, 16, dip);
 			PutCsum(p, 0, 20, 10);
 			p[20] = (byte)(sp >> 8); p[21] = (byte)sp; p[22] = (byte)(dp >> 8); p[23] = (byte)dp;
-			p[24] = (byte)(ul >> 8); p[25] = (byte)ul;
-			Buffer.BlockCopy(data, 0, p, 28, data.Length);
+			p[24] = (byte)(ul >> 8); p[25] = (byte)ul; p[26] = 0; p[27] = 0;
+			if (data.Length > 0) Buffer.BlockCopy(data, 0, p, 28, data.Length);
 			PutUdpCsum(p, sip, dip, ul);
-			return p;
+			return tot;
 		}
-		static int ParseWScale(byte[] ip, int ihl, int doff) {
+		static int ParseOpt(byte[] ip, int ihl, int doff, int kind, int need) {
 			int o = ihl + 20, end = ihl + doff;
 			while (o < end) {
 				int k = ip[o];
@@ -4357,19 +4834,28 @@ namespace PowerTorrent {
 				if (k == 1) { o++; continue; }
 				if (o + 1 >= end) break;
 				int l = ip[o + 1]; if (l < 2 || o + l > end) break;
-				if (k == 3 && l == 3) return ip[o + 2];
+				if (k == kind && l == need) return o;
 				o += l;
 			}
-			return 0;
+			return -1;
 		}
-		static byte[] BuildTcp(uint sip, ushort sp, uint dip, ushort dp, uint seq, uint ack, int flags, byte[] payload) {
+		static int ParseWScale(byte[] ip, int ihl, int doff) {
+			int o = ParseOpt(ip, ihl, doff, 3, 3);
+			return o < 0 ? 0 : ip[o + 2];
+		}
+		static int ParseMss(byte[] ip, int ihl, int doff) {
+			int o = ParseOpt(ip, ihl, doff, 2, 4);
+			if (o < 0 || o + 3 >= ip.Length) return 0;
+			return (ip[o + 2] << 8) | ip[o + 3];
+		}
+		static int FillTcp(byte[] p, uint sip, ushort sp, uint dip, ushort dp, uint seq, uint ack, int flags, byte[] payload) {
+			if (payload == null) payload = NoPay;
 			bool syn = (flags & 2) != 0;
 			int hl = syn ? 28 : 20;
 			int tot = 20 + hl + payload.Length;
-			byte[] p = new byte[tot];
-			p[0] = 0x45; p[2] = (byte)(tot >> 8); p[3] = (byte)tot;
+			p[0] = 0x45; p[1] = 0; p[2] = (byte)(tot >> 8); p[3] = (byte)tot;
 			uint id = ++ipId; p[4] = (byte)(id >> 8); p[5] = (byte)id;
-			p[8] = 64; p[9] = 6;
+			p[6] = 0; p[7] = 0; p[8] = 64; p[9] = 6; p[10] = 0; p[11] = 0;
 			PutIp(p, 12, sip); PutIp(p, 16, dip);
 			PutCsum(p, 0, 20, 10);
 			int o = 20;
@@ -4378,41 +4864,142 @@ namespace PowerTorrent {
 			p[o + 8] = (byte)(ack >> 24); p[o + 9] = (byte)(ack >> 16); p[o + 10] = (byte)(ack >> 8); p[o + 11] = (byte)ack;
 			p[o + 12] = (byte)((hl / 4) << 4); p[o + 13] = (byte)flags;
 			p[o + 14] = 0xFF; p[o + 15] = 0xFF;
+			p[o + 16] = 0; p[o + 17] = 0; p[o + 18] = 0; p[o + 19] = 0;
 			if (syn) {
-				int mss = VpnTcp.Mss;
+				int mss = SegMss();
 				p[o + 20] = 2; p[o + 21] = 4; p[o + 22] = (byte)(mss >> 8); p[o + 23] = (byte)mss;
 				p[o + 24] = 1; p[o + 25] = 3; p[o + 26] = 3; p[o + 27] = (byte)VpnTcp.WScale;
 			}
 			if (payload.Length > 0) Buffer.BlockCopy(payload, 0, p, 20 + hl, payload.Length);
 			PutTcpCsum(p, sip, dip, hl + payload.Length);
-			return p;
+			return tot;
 		}
 		static void PutIp(byte[] p, int o, uint ip) { p[o] = (byte)(ip >> 24); p[o + 1] = (byte)(ip >> 16); p[o + 2] = (byte)(ip >> 8); p[o + 3] = (byte)ip; }
 		static void PutCsum(byte[] p, int o, int n, int csumOff) {
 			p[csumOff] = 0; p[csumOff + 1] = 0;
 			ushort s = Csum(p, o, n); p[csumOff] = (byte)(s >> 8); p[csumOff + 1] = (byte)s;
 		}
+		static uint CsumAcc(uint s, byte[] d, int o, int n) {
+			int i = 0;
+			while (i + 1 < n) { s += (uint)((d[o + i] << 8) | d[o + i + 1]); i += 2; }
+			if (i < n) s += (uint)(d[o + i] << 8);
+			return s;
+		}
+		static ushort CsumFold(uint s) {
+			while ((s >> 16) != 0) s = (s & 0xffff) + (s >> 16);
+			return (ushort)(~s);
+		}
 		static void PutUdpCsum(byte[] p, uint sip, uint dip, int ul) {
-			byte[] ph = new byte[12 + ul];
-			PutIp(ph, 0, sip); PutIp(ph, 4, dip); ph[9] = 17; ph[10] = (byte)(ul >> 8); ph[11] = (byte)ul;
-			Buffer.BlockCopy(p, 20, ph, 12, ul);
-			ushort s = Csum(ph, 0, ph.Length);
-			if (s == 0) s = 0xFFFF;
-			p[26] = (byte)(s >> 8); p[27] = (byte)s;
+			p[26] = 0; p[27] = 0;
+			uint s = (sip >> 16) + (sip & 0xffff);
+			s += (dip >> 16) + (dip & 0xffff);
+			s += 17u + (uint)ul;
+			s = CsumAcc(s, p, 20, ul);
+			ushort c = CsumFold(s);
+			if (c == 0) c = 0xFFFF;
+			p[26] = (byte)(c >> 8); p[27] = (byte)c;
 		}
 		static void PutTcpCsum(byte[] p, uint sip, uint dip, int tl) {
 			p[36] = 0; p[37] = 0;
-			byte[] ph = new byte[12 + tl];
-			PutIp(ph, 0, sip); PutIp(ph, 4, dip); ph[9] = 6; ph[10] = (byte)(tl >> 8); ph[11] = (byte)tl;
-			Buffer.BlockCopy(p, 20, ph, 12, tl);
-			ushort s = Csum(ph, 0, ph.Length); p[36] = (byte)(s >> 8); p[37] = (byte)s;
+			uint s = (sip >> 16) + (sip & 0xffff);
+			s += (dip >> 16) + (dip & 0xffff);
+			s += 6u + (uint)tl;
+			s = CsumAcc(s, p, 20, tl);
+			ushort c = CsumFold(s);
+			p[36] = (byte)(c >> 8); p[37] = (byte)c;
 		}
 		static ushort Csum(byte[] d, int o, int n) {
-			uint s = 0; int i = 0;
-			while (i + 1 < n) { s += (uint)((d[o + i] << 8) | d[o + i + 1]); i += 2; }
-			if (i < n) s += (uint)(d[o + i] << 8);
-			while ((s >> 16) != 0) s = (s & 0xffff) + (s >> 16);
-			return (ushort)(~s);
+			return CsumFold(CsumAcc(0, d, o, n));
+		}
+		static string TcpCcSelfCheck() {
+			VpnTcp t = new VpnTcp();
+			if (t.cwnd != VpnTcp.Mss * VpnTcp.IwSegs) return "cc-iw";
+			if (t.ssthresh != VpnTcp.CwndMax) return "cc-ssthresh";
+			if (t.FlightCap() != t.cwnd) return "cc-cap";
+			t.peerWnd = 20000;
+			if (t.FlightCap() != 20000) return "cc-peer";
+			t.OnNewAck(100000);
+			if (t.cwnd != VpnTcp.Mss * VpnTcp.IwSegs + 2 * VpnTcp.Mss) return "cc-ss";
+			t.ssthresh = t.cwnd;
+			int c0 = t.cwnd;
+			t.OnNewAck(VpnTcp.Mss);
+			int inc = (VpnTcp.Mss * VpnTcp.Mss) / c0;
+			if (inc < 1) inc = 1;
+			if (t.cwnd != c0 + inc) return "cc-ca";
+			VpnTcp r = new VpnTcp();
+			r.NoteRtt(1);
+			if (r.rtoMs != 50 || r.rtoCur != 50) return "cc-floor";
+			r.NoteRtt(80);
+			if (r.srttMs < 1 || r.rtoMs < 50 || r.rtoMs > 3000) return "cc-rto";
+			VpnTcp g = new VpnTcp();
+			g.cwnd = 5 * 1024 * 1024;
+			g.ssthresh = VpnTcp.CwndMax;
+			g.OnNewAck(VpnTcp.Mss);
+			if (g.cwnd != 5 * 1024 * 1024 + VpnTcp.Mss) return "cc-grow";
+			g.cwnd = VpnTcp.CwndMax - 100;
+			g.OnNewAck(VpnTcp.Mss);
+			if (g.cwnd != VpnTcp.CwndMax) return "cc-max";
+			VpnTcp fr = new VpnTcp();
+			fr.state = 3;
+			fr.sndUna = 1000;
+			fr.sndNxt = 1040;
+			for (int i = 0; i < 4; i++) {
+				VpnSeg s = new VpnSeg();
+				s.data = new byte[10];
+				s.seq = (uint)(1000 + i * 10);
+				s.sent = DateTime.UtcNow;
+				s.sends = 1;
+				fr.flight.Add(s);
+			}
+			fr.lastRawWnd = 1000;
+			fr.OnCumulativeAck(1000, true);
+			fr.OnCumulativeAck(1000, true);
+			fr.OnCumulativeAck(1000, true);
+			if (!fr.fastRec || fr.rexmit == null || fr.rexmit.seq != 1000) return "cc-fr-enter";
+			if (fr.ssthresh != 2 * VpnTcp.Mss) return "cc-fr-ss";
+			if (fr.cwnd != fr.ssthresh + 3 * VpnTcp.Mss) return "cc-fr-cwnd";
+			fr.OnCumulativeAck(1020, true);
+			if (!fr.fastRec || fr.rexmit == null || fr.rexmit.seq != 1020) return "cc-fr-partial";
+			fr.OnCumulativeAck(1040, true);
+			if (fr.fastRec || fr.flight.Count != 0) return "cc-fr-exit";
+			if (fr.cwnd != fr.ssthresh) return "cc-fr-deflate";
+			VpnTcp to = new VpnTcp();
+			to.state = 3;
+			to.sndUna = 5;
+			to.sndNxt = 15;
+			to.rtoCur = 250;
+			VpnSeg ts = new VpnSeg();
+			ts.data = new byte[10];
+			ts.seq = 5;
+			ts.sends = 1;
+			ts.sent = DateTime.UtcNow.AddMilliseconds(-400);
+			to.flight.Add(ts);
+			if (!to.OnRetransmitTimeout(DateTime.UtcNow)) return "cc-to";
+			if (to.cwnd != VpnTcp.Mss || to.fastRec || to.rexmit == null || to.rexmit.sends != 2) return "cc-to-cut";
+			int ss = to.ssthresh;
+			int r1 = to.rtoCur;
+			if (!to.OnRetransmitTimeout(DateTime.UtcNow.AddSeconds(30))) return "cc-to2";
+			if (to.ssthresh != ss || to.rtoCur <= r1 || to.cwnd != VpnTcp.Mss) return "cc-to-hold";
+			byte[] opt = new byte[28];
+			opt[20] = 2; opt[21] = 4; opt[22] = 0x05; opt[23] = 0x78;
+			opt[24] = 1; opt[25] = 3; opt[26] = 3; opt[27] = 7;
+			if (ParseMss(opt, 0, 28) != 1400) return "mss";
+			if (ParseWScale(opt, 0, 28) != 7) return "wscale";
+			if (SegMss() < 536 || SegMss() > 1440) return "seg-mss";
+			byte[] pkt = new byte[64];
+			int tn = FillTcp(pkt, 0x0a000001, 1000, 0x0a000002, 80, 1, 0, 0x10, new byte[] { 1, 2, 3, 4 });
+			uint sum = (0x0a000001u >> 16) + (0x0a000001u & 0xffff);
+			sum += (0x0a000002u >> 16) + (0x0a000002u & 0xffff);
+			sum += 6u + (uint)(tn - 20);
+			sum = CsumAcc(sum, pkt, 20, tn - 20);
+			if (CsumFold(sum) != 0) return "tcp-csum";
+			int un = FillUdp(pkt, 0x0a000001, 1000, 0x0a000002, 53, new byte[] { 9, 8, 7 });
+			uint us = (0x0a000001u >> 16) + (0x0a000001u & 0xffff);
+			us += (0x0a000002u >> 16) + (0x0a000002u & 0xffff);
+			us += 17u + (uint)(un - 20);
+			us = CsumAcc(us, pkt, 20, un - 20);
+			if (CsumFold(us) != 0) return "udp-csum";
+			return null;
 		}
 		static byte[] Tai() {
 			byte[] t = new byte[12];
@@ -5266,6 +5853,15 @@ namespace PowerTorrent {
 		}
 		public static void ReleaseAnnounce() {
 			try { announceSem.Release(); } catch { }
+		}
+
+		public static void ResetTransport() {
+			Engine[] snap;
+			lock (gate) snap = engines.ToArray();
+			for (int i = 0; i < snap.Length; i++) {
+				try { snap[i].DropPeers(); } catch { }
+			}
+			RebindListen();
 		}
 
 		public static void RebindListen() {
@@ -8174,6 +8770,20 @@ namespace PowerTorrent {
 				if (pool.Count == 0) return null;
 				return pool.Dequeue();
 			}
+		}
+
+		public void DropPeers() {
+			PeerWorker[] snap;
+			lock (peerLock) snap = peers.ToArray();
+			for (int i = 0; i < snap.Length; i++) {
+				try { snap[i].Kill(); } catch { }
+			}
+			lock (poolLock) {
+				pool.Clear();
+				foreach (string s in seen) pool.Enqueue(s);
+				lastRecycle = DateTime.UtcNow;
+			}
+			if (snap.Length > 0) Log(1, "dropped " + snap.Length.ToString(CultureInfo.InvariantCulture) + " peer connection(s) for killswitch");
 		}
 
 		void RecyclePeers() {
@@ -12426,7 +13036,12 @@ function Show-PowerTorrentGui {
 			$want = [bool]$ui.chkVpnRequire.IsChecked
 			$script:PtVpnRequire = $want
 			[PowerTorrent.VpnHub]::Require = $want
-			try { [PowerTorrent.Session]::RebindListen() } catch { }
+			if ($want) {
+				try { [PowerTorrent.Session]::ResetTransport() } catch { }
+				Add-UiLog 'Killswitch on: dropped existing connections'
+			} else {
+				try { [PowerTorrent.Session]::RebindListen() } catch { }
+			}
 			if ($want) { Show-PtKillswitchPopup -Why On }
 			else { Show-PtKillswitchPopup -Why Off }
 			try { Update-PtVpnUi } catch { }
@@ -12459,8 +13074,9 @@ function Show-PowerTorrentGui {
 					} finally { $script:PtVpnChkQuiet = $false }
 				}
 				[PowerTorrent.VpnHub]::Require = $true
+				try { [PowerTorrent.Session]::ResetTransport() } catch { }
 				$script:PtVpnAuto = $true
-				Add-UiLog 'VPN config imported'
+				Add-UiLog 'VPN config imported; dropped existing connections'
 				Update-PtVpnUi
 				Start-PtVpnBackground -FromImport
 			} catch {
