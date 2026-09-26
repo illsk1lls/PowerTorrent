@@ -929,6 +929,20 @@ namespace PowerTorrent {
 				dst.Add(string.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}.{3}:{4}", data[o], data[o + 1], data[o + 2], data[o + 3], port));
 			}
 		}
+		public static void AddCompact6(byte[] data, List<string> dst) {
+			if (data == null) return;
+			int n = data.Length / 18;
+			for (int i = 0; i < n; i++) {
+				int o = i * 18;
+				int port = (data[o + 16] << 8) | data[o + 17];
+				if (port <= 0 || port > 65535) continue;
+				byte[] raw = new byte[16];
+				Buffer.BlockCopy(data, o, raw, 0, 16);
+				IPAddress ip = new IPAddress(raw);
+				if (IPAddress.IsLoopback(ip)) continue;
+				dst.Add("[" + ip.ToString() + "]:" + port.ToString(CultureInfo.InvariantCulture));
+			}
+		}
 		public static IPAddress ResolveV4(string host) {
 			try {
 				IPAddress parsed;
@@ -948,7 +962,7 @@ namespace PowerTorrent {
 		}
 		public static byte[] MakePeerId() {
 			byte[] id = new byte[20];
-			byte[] prefix = Encoding.ASCII.GetBytes("-PT1200-");
+			byte[] prefix = Encoding.ASCII.GetBytes("-PT1400-");
 			Buffer.BlockCopy(prefix, 0, id, 0, 8);
 			RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider();
 			byte[] r = new byte[12];
@@ -1256,6 +1270,7 @@ namespace PowerTorrent {
 		public abstract bool PollRead(int microSeconds);
 		public abstract int Available { get; }
 		public abstract void Close();
+		public virtual IPEndPoint Remote { get { return null; } }
 	}
 
 	internal sealed class TcpPeerIo : PeerIo {
@@ -1361,6 +1376,20 @@ namespace PowerTorrent {
 			try { if (st != null) st.Close(); } catch { }
 			try { if (vt != null) vt.Close(); } catch { }
 			try { if (tcp != null) tcp.Close(); } catch { }
+		}
+		public override IPEndPoint Remote {
+			get {
+				try {
+					if (tcp != null && tcp.Client != null && tcp.Client.RemoteEndPoint != null)
+						return (IPEndPoint)tcp.Client.RemoteEndPoint;
+				} catch { }
+				if (vt != null && vt.remIp != 0) {
+					uint ip = vt.remIp;
+					IPAddress a = new IPAddress(new byte[] { (byte)(ip >> 24), (byte)(ip >> 16), (byte)(ip >> 8), (byte)ip });
+					return new IPEndPoint(a, vt.remPort);
+				}
+				return null;
+			}
 		}
 		bool SockReady() {
 			if (vt != null) return vt.Available > 0;
@@ -1706,7 +1735,8 @@ namespace PowerTorrent {
 		public UtpConn(UtpHub hub) { this.hub = hub; }
 
 		public bool Connect(string host, int port, int timeoutMs) {
-			IPAddress ip = Bt.ResolveV4(host);
+			IPAddress ip;
+			if (!IPAddress.TryParse(host, out ip) || ip == null) ip = Bt.ResolveV4(host);
 			if (ip == null) return false;
 			Remote = new IPEndPoint(ip, port);
 			Random rng = new Random(Guid.NewGuid().GetHashCode());
@@ -1931,6 +1961,7 @@ namespace PowerTorrent {
 			}
 		}
 		public override void Close() { c.Close(); }
+		public override IPEndPoint Remote { get { return c != null ? c.Remote : null; } }
 	}
 
 	internal sealed class UtpHub {
@@ -2010,6 +2041,10 @@ namespace PowerTorrent {
 						from = new IPEndPoint(any.Address, any.Port);
 					}
 					if (pkt == null || pkt.Length < 20) continue;
+					if (pkt[0] == (byte)'d') {
+						Dht.OnPacket(pkt, from);
+						continue;
+					}
 					int connId = (pkt[2] << 8) | pkt[3];
 					int type = (pkt[0] >> 4) & 0xF;
 					UtpConn c = null;
@@ -2787,6 +2822,14 @@ namespace PowerTorrent {
 		X509Certificate2 caCert, clCert;
 		byte[] kmClient, kmServer;
 
+		public static string PickCipher(string cipher, string dataCiphers) {
+			if (!string.IsNullOrEmpty(dataCiphers)) {
+				if (dataCiphers.IndexOf("AES-256-GCM", StringComparison.OrdinalIgnoreCase) >= 0) return "AES-256-GCM";
+				return null;
+			}
+			if (string.IsNullOrEmpty(cipher)) return "AES-256-GCM";
+			return cipher.ToUpperInvariant();
+		}
 		public static bool TryParse(string text, out OvpnSess s, out string err) {
 			s = null; err = "";
 			if (string.IsNullOrEmpty(text)) { err = "empty config"; return false; }
@@ -2802,6 +2845,8 @@ namespace PowerTorrent {
 			OvpnSess o = new OvpnSess();
 			string proto = "udp";
 			string host = null; int port = 1194;
+			string dataCiphers = null;
+			string cipherLine = null;
 			string[] lines = text.Replace("\r", "").Split('\n');
 			for (int i = 0; i < lines.Length; i++) {
 				string ln = lines[i].Trim();
@@ -2816,9 +2861,27 @@ namespace PowerTorrent {
 						if (p.Length >= 4) proto = p[3].ToLowerInvariant();
 					}
 				} else if (k == "proto" && p.Length >= 2) proto = p[1].ToLowerInvariant();
-				else if (k == "cipher" && p.Length >= 2) o.CipherName = p[1].ToUpperInvariant();
+				else if (k == "cipher" && p.Length >= 2) cipherLine = p[1];
+				else if ((k == "data-ciphers" || k == "ncp-ciphers") && p.Length >= 2) dataCiphers = ln.Substring(p[0].Length).Trim();
 				else if (k == "tun-mtu" && p.Length >= 2) int.TryParse(p[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out o.TunMtu);
 				else if (k == "port" && p.Length >= 2 && host == null) int.TryParse(p[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out port);
+			}
+			string picked = PickCipher(cipherLine, dataCiphers);
+			if (picked == null) {
+				err = "OpenVPN data-ciphers does not include AES-256-GCM.";
+				return false;
+			}
+			o.CipherName = picked;
+			string creds = Pem.Tag(text, "auth-user-pass");
+			if (!string.IsNullOrEmpty(creds)) {
+				string[] ul = creds.Replace("\r", "").Split('\n');
+				List<string> got = new List<string>();
+				for (int i = 0; i < ul.Length; i++) {
+					string u = ul[i].Trim();
+					if (u.Length > 0) got.Add(u);
+				}
+				if (got.Count >= 1) o.User = got[0];
+				if (got.Count >= 2) o.Pass = got[1];
 			}
 			if (string.IsNullOrEmpty(host)) { err = "OpenVPN config missing remote"; return false; }
 			if (proto.IndexOf("tcp", StringComparison.Ordinal) >= 0) {
@@ -3676,7 +3739,7 @@ namespace PowerTorrent {
 
 		public static bool HttpGet(string url, int timeoutMs, string ua, out int status, out byte[] body) {
 			status = 0; body = null;
-			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.2";
+			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.4";
 			if (up) return HttpRequest(url, timeoutMs, -1, -1, ua, out status, out body);
 			if (Require && HasConfig) return false;
 			return HttpOsGetBytes(url, timeoutMs, ua, out status, out body);
@@ -3719,12 +3782,12 @@ namespace PowerTorrent {
 			} catch { return false; }
 		}
 		public static bool HttpRequest(string url, int timeoutMs, long rangeStart, long rangeEnd, out int status, out byte[] body) {
-			return HttpRequest(url, timeoutMs, rangeStart, rangeEnd, "PowerTorrent/1.2", out status, out body);
+			return HttpRequest(url, timeoutMs, rangeStart, rangeEnd, "PowerTorrent/1.4", out status, out body);
 		}
 		public static bool HttpRequest(string url, int timeoutMs, long rangeStart, long rangeEnd, string ua, out int status, out byte[] body) {
 			status = 0; body = null;
 			if (!up) return false;
-			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.2";
+			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.4";
 			Uri u; try { u = new Uri(url); } catch { return false; }
 			int port = u.Port; if (port <= 0) port = string.Equals(u.Scheme, "https", StringComparison.OrdinalIgnoreCase) ? 443 : 80;
 			VpnTcp t = ConnectTcp(u.Host, port, timeoutMs); if (t == null) return false;
@@ -3781,6 +3844,7 @@ namespace PowerTorrent {
 
 		static int probeGen;
 		static string HttpOsGet(string url, int timeoutMs) {
+			if (Require && HasConfig) return null;
 			try {
 				try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
 				HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
@@ -3867,7 +3931,7 @@ namespace PowerTorrent {
 			for (int i = 0; i < 4 && up && g == probeGen; i++) {
 				try {
 					if (vpnIp == null) vpnIp = ProbeOnce();
-					if (osIp == null) osIp = ProbeOsOnce();
+					if (osIp == null && !(Require && HasConfig)) osIp = ProbeOsOnce();
 					if (g != probeGen) return;
 					if (vpnIp != null) ProvenIp = vpnIp;
 					if (osIp != null) DirectIp = osIp;
@@ -4364,6 +4428,697 @@ namespace PowerTorrent {
 		}
 	}
 
+	internal static class Dht {
+		sealed class Node {
+			public byte[] Id;
+			public IPEndPoint Ep;
+			public DateTime Last;
+			public int Fail;
+		}
+		sealed class Ann {
+			public byte[] Ip;
+			public int Port;
+			public DateTime At;
+		}
+		sealed class Pend {
+			public IPEndPoint Ep;
+			public DateTime Deadline;
+			public Job Job;
+			public byte[] Ih;
+		}
+		public sealed class Job {
+			public byte[] Ih;
+			public int Port;
+			public Action<string> OnPeer;
+			public Action<int> OnDone;
+			public DateTime Next;
+			public int Found;
+			public int Announced;
+			public bool Busy;
+			public bool Retry;
+		}
+		sealed class Pkt {
+			public IPEndPoint From;
+			public byte[] Data;
+		}
+
+		static readonly object gate = new object();
+		static readonly List<Node> nodes = new List<Node>();
+		static readonly Dictionary<string, List<Ann>> store = new Dictionary<string, List<Ann>>();
+		static readonly Dictionary<string, Job> jobs = new Dictionary<string, Job>();
+		static readonly Dictionary<string, Pend> pending = new Dictionary<string, Pend>();
+		static readonly Queue<Pkt> inbox = new Queue<Pkt>();
+		static byte[] id = new byte[20];
+		static byte[] sec0 = new byte[16];
+		static byte[] sec1 = new byte[16];
+		static DateTime secAt = DateTime.MinValue;
+		static Thread thr;
+		static volatile bool run;
+		static UdpClient ownOs;
+		static VpnUdpSock ownVpn;
+		static int ownPort = -1;
+		static bool ownIsVpn;
+		static string voteIp = "";
+		static int voteN;
+		static string appliedIp = "";
+
+		public static void OnPacket(byte[] pkt, IPEndPoint from) {
+			if (!run || pkt == null || from == null || pkt.Length < 10 || pkt[0] != (byte)'d') return;
+			Pkt p = new Pkt();
+			p.From = from;
+			p.Data = pkt;
+			lock (inbox) {
+				inbox.Enqueue(p);
+				while (inbox.Count > 200) inbox.Dequeue();
+			}
+		}
+
+		public static void Want(byte[] ih, int port, Action<string> onPeer, Action<int> onDone) {
+			if (ih == null || ih.Length != 20) return;
+			Ensure();
+			string key = Hex(ih);
+			lock (gate) {
+				Job j;
+				if (!jobs.TryGetValue(key, out j)) {
+					j = new Job();
+					j.Ih = (byte[])ih.Clone();
+					j.Next = DateTime.UtcNow.AddSeconds(2 * jobs.Count);
+					jobs[key] = j;
+				}
+				if (port > 0) j.Port = port;
+				if (onPeer != null) j.OnPeer = onPeer;
+				if (onDone != null) j.OnDone = onDone;
+			}
+		}
+
+		public static void Unwant(byte[] ih) {
+			if (ih == null || ih.Length != 20) return;
+			lock (gate) jobs.Remove(Hex(ih));
+		}
+
+		public static void Attach(int port) {
+			Ensure();
+			bool vpn = VpnHub.TunnelOn;
+			if (VpnHub.Blocked || port <= 0) { CloseOwn(); return; }
+			if (Session.Utp != null) { CloseOwn(); return; }
+			if (ownPort == port && ownIsVpn == vpn && (ownVpn != null || ownOs != null)) return;
+			CloseOwn();
+			try {
+				if (vpn) ownVpn = VpnHub.BindUdp(port);
+				else ownOs = new UdpClient(port);
+				ownPort = port;
+				ownIsVpn = vpn;
+			} catch {
+				ownPort = -1;
+			}
+		}
+
+		public static string SelfCheck() {
+			byte[] nine = Encoding.ASCII.GetBytes("123456789");
+			uint c = Crc32c(nine, nine.Length);
+			if (c != 0xE3069283u) return "crc32c";
+			IPAddress ip = IPAddress.Parse("1.2.3.4");
+			byte[] ih = new byte[20];
+			ih[19] = 9;
+			byte[] sec = Encoding.ASCII.GetBytes("0123456789abcdef");
+			byte[] t1 = MakeToken(ip, ih, sec);
+			byte[] t2 = MakeToken(ip, ih, sec);
+			if (t1 == null || t1.Length != 4 || !TokenEq(t1, t2)) return "token";
+			t2[0] ^= 1;
+			if (TokenEq(t1, t2)) return "token-flip";
+			byte[] target = new byte[20];
+			target[0] = 0x10;
+			byte[] far = new byte[20];
+			byte[] near = new byte[20];
+			near[0] = 0x10;
+			if (XorCmp(near, far, target) >= 0) return "xor";
+			return null;
+		}
+
+		static void Ensure() {
+			lock (gate) {
+				if (thr != null) return;
+				RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider();
+				rng.GetBytes(id);
+				rng.GetBytes(sec0);
+				rng.GetBytes(sec1);
+				rng.Dispose();
+				secAt = DateTime.UtcNow;
+				run = true;
+				thr = new Thread(Loop);
+				thr.IsBackground = true;
+				thr.Name = "pt-dht";
+				thr.Start();
+			}
+		}
+
+		static void CloseOwn() {
+			try { if (ownOs != null) ownOs.Close(); } catch { }
+			try { if (ownVpn != null) VpnHub.DropUdp(ownVpn); } catch { }
+			ownOs = null;
+			ownVpn = null;
+			ownPort = -1;
+		}
+
+		static void Loop() {
+			string[] boots = new string[] {
+				"router.bittorrent.com:6881",
+				"dht.transmissionbt.com:6881",
+				"router.utorrent.com:6881",
+				"dht.libtorrent.org:25401"
+			};
+			DateTime nextBoot = DateTime.MinValue;
+			while (run) {
+				try {
+					if (VpnHub.Blocked) { Thread.Sleep(400); continue; }
+					PumpOnce(40);
+					Expire();
+					DateTime now = DateTime.UtcNow;
+					if ((now - secAt).TotalMinutes >= 5) {
+						sec1 = sec0;
+						sec0 = new byte[16];
+						RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider();
+						rng.GetBytes(sec0);
+						rng.Dispose();
+						secAt = now;
+					}
+					int ncount;
+					lock (gate) ncount = nodes.Count;
+					if (ncount < 8 && now >= nextBoot) {
+						Bootstrap(boots);
+						nextBoot = now.AddSeconds(20);
+					}
+					Job job = null;
+					lock (gate) {
+						foreach (KeyValuePair<string, Job> kv in jobs) {
+							if (!kv.Value.Busy && kv.Value.Next <= now) { job = kv.Value; job.Busy = true; break; }
+						}
+					}
+					if (job != null) {
+						try { Lookup(job); } catch { }
+						int found = job.Found;
+						bool retry = job.Retry;
+						job.Found = 0;
+						job.Retry = false;
+						lock (gate) {
+							job.Busy = false;
+							job.Next = DateTime.UtcNow.AddSeconds(retry ? 8 : 15 * 60);
+						}
+						if (found > 0 && job.OnDone != null) {
+							try { job.OnDone(found); } catch { }
+						}
+					} else Thread.Sleep(50);
+				} catch {
+					Thread.Sleep(200);
+				}
+			}
+		}
+
+		static void Bootstrap(string[] boots) {
+			for (int i = 0; i < boots.Length; i++) {
+				int colon = boots[i].LastIndexOf(':');
+				if (colon <= 0) continue;
+				int p;
+				if (!int.TryParse(boots[i].Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out p)) continue;
+				IPAddress ip = Bt.ResolveV4(boots[i].Substring(0, colon));
+				if (ip == null) continue;
+				byte[] tid = NewTid();
+				Dictionary<string, Be> a = new Dictionary<string, Be>();
+				a["target"] = Be.Blob((byte[])id.Clone());
+				Pend pend = new Pend();
+				pend.Ep = new IPEndPoint(ip, p);
+				pend.Deadline = DateTime.UtcNow.AddSeconds(4);
+				lock (gate) pending[TidKey(tid)] = pend;
+				SendTo(EncodeQuery("find_node", a, tid), pend.Ep);
+			}
+		}
+
+		static void Lookup(Job job) {
+			HashSet<string> asked = new HashSet<string>();
+			job.Announced = 0;
+			if (Closest(job.Ih, 1).Count == 0) {
+				DateTime waitNodes = DateTime.UtcNow.AddSeconds(4);
+				while (run && DateTime.UtcNow < waitNodes && Closest(job.Ih, 1).Count == 0) PumpOnce(100);
+			}
+			if (Closest(job.Ih, 1).Count == 0) { job.Retry = true; return; }
+			int queried = 0;
+			DateTime dead = DateTime.UtcNow.AddSeconds(8);
+			while (run && DateTime.UtcNow < dead && queried < 24) {
+				List<Node> closest = Closest(job.Ih, 16);
+				int sent = 0;
+				for (int i = 0; i < closest.Count && sent < 3 && queried < 24; i++) {
+					string k = closest[i].Ep.ToString();
+					if (!asked.Add(k)) continue;
+					byte[] tid = NewTid();
+					Dictionary<string, Be> a = new Dictionary<string, Be>();
+					a["info_hash"] = Be.Blob(job.Ih);
+					Pend pend = new Pend();
+					pend.Ep = closest[i].Ep;
+					pend.Deadline = DateTime.UtcNow.AddSeconds(3);
+					pend.Job = job;
+					pend.Ih = job.Ih;
+					lock (gate) pending[TidKey(tid)] = pend;
+					SendTo(EncodeQuery("get_peers", a, tid), closest[i].Ep);
+					sent++;
+					queried++;
+				}
+				if (sent == 0) break;
+				DateTime round = DateTime.UtcNow.AddMilliseconds(1500);
+				while (run && DateTime.UtcNow < round) {
+					PumpOnce(80);
+					if (PendingJob(job) == 0) break;
+				}
+				Expire();
+			}
+		}
+
+		static int PendingJob(Job job) {
+			int n = 0;
+			lock (gate) {
+				foreach (KeyValuePair<string, Pend> kv in pending) if (kv.Value.Job == job) n++;
+			}
+			return n;
+		}
+
+		static void PumpOnce(int waitMs) {
+			DrainOwn();
+			DateTime dead = DateTime.UtcNow.AddMilliseconds(waitMs);
+			while (true) {
+				Pkt p = null;
+				lock (inbox) { if (inbox.Count > 0) p = inbox.Dequeue(); }
+				if (p == null) break;
+				try { Handle(p.Data, p.From); } catch { }
+			}
+			int left = (int)(dead - DateTime.UtcNow).TotalMilliseconds;
+			if (left > 0) Thread.Sleep(Math.Min(left, 40));
+		}
+
+		static void DrainOwn() {
+			try {
+				if (ownOs != null && ownOs.Client != null && ownOs.Client.Poll(0, SelectMode.SelectRead)) {
+					IPEndPoint ep = new IPEndPoint(IPAddress.Any, 0);
+					byte[] pkt = ownOs.Receive(ref ep);
+					OnPacket(pkt, ep);
+				}
+			} catch { }
+			try {
+				if (ownVpn != null) {
+					byte[] d;
+					IPEndPoint f;
+					if (ownVpn.Recv(0, out d, out f) && d != null && f != null) OnPacket(d, f);
+				}
+			} catch { }
+		}
+
+		static void Expire() {
+			List<Pend> dead = new List<Pend>();
+			List<string> keys = new List<string>();
+			DateTime now = DateTime.UtcNow;
+			lock (gate) {
+				foreach (KeyValuePair<string, Pend> kv in pending) {
+					if (kv.Value.Deadline >= now) continue;
+					keys.Add(kv.Key);
+					dead.Add(kv.Value);
+				}
+				for (int i = 0; i < keys.Count; i++) pending.Remove(keys[i]);
+				for (int i = 0; i < dead.Count; i++) NoteFail(dead[i].Ep);
+			}
+		}
+
+		static void NoteFail(IPEndPoint ep) {
+			if (ep == null) return;
+			for (int i = nodes.Count - 1; i >= 0; i--) {
+				if (!nodes[i].Ep.Address.Equals(ep.Address) || nodes[i].Ep.Port != ep.Port) continue;
+				nodes[i].Fail++;
+				if (nodes[i].Fail >= 3) nodes.RemoveAt(i);
+				return;
+			}
+		}
+
+		static void Handle(byte[] pkt, IPEndPoint from) {
+			if (VpnHub.Blocked) return;
+			Be root = Benc.Decode(pkt);
+			if (root == null || root.Dict == null) return;
+			string y = root.Str("y");
+			Be t = root.Get("t");
+			if (t == null || t.Bytes == null || t.Bytes.Length == 0 || t.Bytes.Length > 16) return;
+			Be ipf = root.Get("ip");
+			if (ipf != null && ipf.Bytes != null) NoteExternal(ipf.Bytes);
+			if (y == "r") {
+				Pend pend;
+				lock (gate) {
+					string k = TidKey(t.Bytes);
+					if (!pending.TryGetValue(k, out pend)) return;
+					pending.Remove(k);
+				}
+				TakeReply(root.Get("r"), from, pend);
+				return;
+			}
+			if (y != "q") return;
+			string q = root.Str("q");
+			Be a = root.Get("a");
+			if (a == null) return;
+			byte[] nid = ArgBytes(a, "id", 20);
+			if (nid != null) RememberNode(nid, from, true);
+			if (q == "ping") {
+				Reply(t.Bytes, new Dictionary<string, Be>(), from);
+			} else if (q == "find_node") {
+				byte[] target = ArgBytes(a, "target", 20);
+				if (target == null) { ReplyErr(t.Bytes, 203, "missing target", from); return; }
+				Dictionary<string, Be> r = new Dictionary<string, Be>();
+				r["nodes"] = Be.Blob(NodesBlob(target));
+				Reply(t.Bytes, r, from);
+			} else if (q == "get_peers") {
+				byte[] ih = ArgBytes(a, "info_hash", 20);
+				if (ih == null) { ReplyErr(t.Bytes, 203, "missing info_hash", from); return; }
+				Dictionary<string, Be> r = new Dictionary<string, Be>();
+				r["nodes"] = Be.Blob(NodesBlob(ih));
+				r["token"] = Be.Blob(MakeToken(from.Address, ih, sec0));
+				List<Be> vals = PeerValues(ih);
+				if (vals.Count > 0) r["values"] = Be.FromList(vals);
+				Reply(t.Bytes, r, from);
+			} else if (q == "announce_peer") {
+				byte[] ih = ArgBytes(a, "info_hash", 20);
+				Be tok = a.Get("token");
+				if (ih == null || tok == null || tok.Bytes == null) { ReplyErr(t.Bytes, 203, "missing token", from); return; }
+				if (!TokenOk(from.Address, ih, tok.Bytes)) { ReplyErr(t.Bytes, 203, "invalid token", from); return; }
+				int port = (int)a.GetInt("port", 0);
+				if (a.GetInt("implied_port", 0) != 0) port = from.Port;
+				if (port <= 0 || port > 65535) { ReplyErr(t.Bytes, 203, "invalid port", from); return; }
+				if (from.Address.AddressFamily == AddressFamily.InterNetwork)
+					StorePeer(ih, from.Address.GetAddressBytes(), port);
+				Reply(t.Bytes, new Dictionary<string, Be>(), from);
+			} else {
+				byte[] target = ArgBytes(a, "target", 20);
+				if (target == null) target = ArgBytes(a, "info_hash", 20);
+				if (target == null) { ReplyErr(t.Bytes, 204, "unknown method", from); return; }
+				Dictionary<string, Be> r = new Dictionary<string, Be>();
+				r["nodes"] = Be.Blob(NodesBlob(target));
+				Reply(t.Bytes, r, from);
+			}
+		}
+
+		static void TakeReply(Be r, IPEndPoint from, Pend pend) {
+			if (r == null) return;
+			byte[] nid = ArgBytes(r, "id", 20);
+			if (nid != null) RememberNode(nid, from, true);
+			Be nb = r.Get("nodes");
+			if (nb != null && nb.Bytes != null) IngestNodes(nb.Bytes);
+			if (pend == null || pend.Job == null || pend.Ih == null) return;
+			Be tok = r.Get("token");
+			if (tok != null && tok.Bytes != null && tok.Bytes.Length > 0 && tok.Bytes.Length <= 64 && pend.Job.Port > 0 && pend.Job.Announced < 8) {
+				pend.Job.Announced++;
+				Dictionary<string, Be> a = new Dictionary<string, Be>();
+				a["info_hash"] = Be.Blob(pend.Ih);
+				a["port"] = Be.Int(pend.Job.Port);
+				a["token"] = Be.Blob(tok.Bytes);
+				byte[] tid = NewTid();
+				try { SendTo(EncodeQuery("announce_peer", a, tid), from); } catch { }
+			}
+			Be values = r.Get("values");
+			if (values == null || values.List == null) return;
+			int added = 0;
+			for (int i = 0; i < values.List.Count; i++) {
+				byte[] v = values.List[i].Bytes;
+				if (v == null) continue;
+				List<string> tmp = new List<string>();
+				if (v.Length == 6) Bt.AddCompactPeers(v, tmp);
+				else if (v.Length == 18) Bt.AddCompact6(v, tmp);
+				else if (v.Length > 6 && v.Length % 6 == 0) Bt.AddCompactPeers(v, tmp);
+				for (int k = 0; k < tmp.Count; k++) {
+					if (pend.Job.OnPeer != null) {
+						try { pend.Job.OnPeer(tmp[k]); } catch { }
+					}
+					added++;
+					StoreEndpoint(pend.Ih, tmp[k]);
+				}
+			}
+			if (added > 0) pend.Job.Found += added;
+		}
+
+		static void StoreEndpoint(byte[] ih, string ep) {
+			int colon = ep.LastIndexOf(':');
+			if (colon <= 0) return;
+			string h = ep.Substring(0, colon);
+			if (h.Length >= 2 && h[0] == '[') h = h.Substring(1, h.Length - 2);
+			int p;
+			if (!int.TryParse(ep.Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out p)) return;
+			IPAddress ip;
+			if (!IPAddress.TryParse(h, out ip)) return;
+			if (ip.AddressFamily != AddressFamily.InterNetwork) return;
+			StorePeer(ih, ip.GetAddressBytes(), p);
+		}
+
+		static void IngestNodes(byte[] raw) {
+			if (raw == null) return;
+			int n = raw.Length / 26;
+			for (int i = 0; i < n; i++) {
+				int o = i * 26;
+				byte[] nid = new byte[20];
+				Buffer.BlockCopy(raw, o, nid, 0, 20);
+				if (raw[o + 20] == 0 || raw[o + 20] == 127) continue;
+				int p = (raw[o + 24] << 8) | raw[o + 25];
+				if (p <= 0) continue;
+				IPAddress ip = new IPAddress(new byte[] { raw[o + 20], raw[o + 21], raw[o + 22], raw[o + 23] });
+				RememberNode(nid, new IPEndPoint(ip, p), false);
+			}
+		}
+
+		static void RememberNode(byte[] nid, IPEndPoint ep, bool heard) {
+			if (nid == null || nid.Length != 20 || ep == null || ep.Port <= 0 || ep.Address == null) return;
+			if (ep.Address.AddressFamily != AddressFamily.InterNetwork) return;
+			byte[] raw = ep.Address.GetAddressBytes();
+			if (raw.Length != 4 || raw[0] == 0 || raw[0] == 127 || raw[0] == 255) return;
+			lock (gate) {
+				for (int i = 0; i < nodes.Count; i++) {
+					if (nodes[i].Ep.Address.Equals(ep.Address) && nodes[i].Ep.Port == ep.Port) {
+						nodes[i].Id = (byte[])nid.Clone();
+						nodes[i].Last = DateTime.UtcNow;
+						if (heard) nodes[i].Fail = 0;
+						return;
+					}
+				}
+				Node n = new Node();
+				n.Id = (byte[])nid.Clone();
+				n.Ep = ep;
+				n.Last = DateTime.UtcNow;
+				if (nodes.Count < 128) { nodes.Add(n); return; }
+				int worst = 0;
+				for (int i = 1; i < nodes.Count; i++) {
+					if (nodes[i].Fail > nodes[worst].Fail) worst = i;
+					else if (nodes[i].Fail == nodes[worst].Fail && nodes[i].Last < nodes[worst].Last) worst = i;
+				}
+				if (nodes[worst].Fail > 0 || (DateTime.UtcNow - nodes[worst].Last).TotalMinutes > 15)
+					nodes[worst] = n;
+			}
+		}
+
+		static List<Node> Closest(byte[] target, int k) {
+			List<Node> all = new List<Node>();
+			lock (gate) {
+				for (int i = 0; i < nodes.Count; i++) all.Add(nodes[i]);
+			}
+			all.Sort(delegate(Node x, Node y) { return XorCmp(x.Id, y.Id, target); });
+			if (all.Count > k) all.RemoveRange(k, all.Count - k);
+			return all;
+		}
+
+		static byte[] NodesBlob(byte[] target) {
+			List<Node> c = Closest(target, 8);
+			List<byte> buf = new List<byte>();
+			for (int i = 0; i < c.Count; i++) {
+				if (c[i].Id == null || c[i].Id.Length != 20 || c[i].Ep == null) continue;
+				byte[] raw = c[i].Ep.Address.GetAddressBytes();
+				if (raw.Length != 4) continue;
+				for (int k = 0; k < 20; k++) buf.Add(c[i].Id[k]);
+				for (int k = 0; k < 4; k++) buf.Add(raw[k]);
+				buf.Add((byte)(c[i].Ep.Port >> 8));
+				buf.Add((byte)c[i].Ep.Port);
+			}
+			return buf.ToArray();
+		}
+
+		static List<Be> PeerValues(byte[] ih) {
+			List<Be> vals = new List<Be>();
+			List<Ann> list = null;
+			lock (gate) {
+				List<Ann> got;
+				if (store.TryGetValue(Hex(ih), out got)) list = new List<Ann>(got);
+			}
+			if (list == null) return vals;
+			DateTime now = DateTime.UtcNow;
+			for (int i = 0; i < list.Count && vals.Count < 16; i++) {
+				if ((now - list[i].At).TotalMinutes > 30) continue;
+				if (list[i].Ip == null || list[i].Ip.Length != 4) continue;
+				byte[] c = new byte[6];
+				Buffer.BlockCopy(list[i].Ip, 0, c, 0, 4);
+				c[4] = (byte)(list[i].Port >> 8);
+				c[5] = (byte)list[i].Port;
+				vals.Add(Be.Blob(c));
+			}
+			return vals;
+		}
+
+		static void StorePeer(byte[] ih, byte[] ip, int port) {
+			if (ih == null || ip == null || ip.Length != 4 || port <= 0) return;
+			string key = Hex(ih);
+			lock (gate) {
+				List<Ann> list;
+				if (!store.TryGetValue(key, out list)) {
+					if (store.Count > 200) {
+						string drop = null;
+						foreach (KeyValuePair<string, List<Ann>> kv in store) { drop = kv.Key; break; }
+						if (drop != null) store.Remove(drop);
+					}
+					list = new List<Ann>();
+					store[key] = list;
+				}
+				for (int i = list.Count - 1; i >= 0; i--) {
+					if ((DateTime.UtcNow - list[i].At).TotalMinutes > 30) list.RemoveAt(i);
+				}
+				for (int i = 0; i < list.Count; i++) {
+					if (list[i].Port == port && list[i].Ip != null && list[i].Ip.Length == 4
+						&& list[i].Ip[0] == ip[0] && list[i].Ip[1] == ip[1] && list[i].Ip[2] == ip[2] && list[i].Ip[3] == ip[3]) {
+						list[i].At = DateTime.UtcNow;
+						return;
+					}
+				}
+				if (list.Count >= 30) list.RemoveAt(0);
+				Ann a = new Ann();
+				a.Ip = (byte[])ip.Clone();
+				a.Port = port;
+				a.At = DateTime.UtcNow;
+				list.Add(a);
+			}
+		}
+
+		static void Reply(byte[] tid, Dictionary<string, Be> r, IPEndPoint to) {
+			byte[] mine = id;
+			r["id"] = Be.Blob((byte[])mine.Clone());
+			Dictionary<string, Be> root = new Dictionary<string, Be>();
+			root["r"] = Be.FromDict(r);
+			root["t"] = Be.Blob(tid);
+			root["y"] = Be.Blob(Encoding.ASCII.GetBytes("r"));
+			SendTo(Benc.Encode(Be.FromDict(root)), to);
+		}
+
+		static void ReplyErr(byte[] tid, int code, string msg, IPEndPoint to) {
+			List<Be> e = new List<Be>();
+			e.Add(Be.Int(code));
+			e.Add(Be.Blob(Encoding.UTF8.GetBytes(msg)));
+			Dictionary<string, Be> root = new Dictionary<string, Be>();
+			root["e"] = Be.FromList(e);
+			root["t"] = Be.Blob(tid);
+			root["y"] = Be.Blob(Encoding.ASCII.GetBytes("e"));
+			SendTo(Benc.Encode(Be.FromDict(root)), to);
+		}
+
+		static byte[] EncodeQuery(string qname, Dictionary<string, Be> a, byte[] tid) {
+			byte[] mine = id;
+			a["id"] = Be.Blob((byte[])mine.Clone());
+			Dictionary<string, Be> root = new Dictionary<string, Be>();
+			root["a"] = Be.FromDict(a);
+			root["q"] = Be.Blob(Encoding.ASCII.GetBytes(qname));
+			root["t"] = Be.Blob(tid);
+			root["y"] = Be.Blob(Encoding.ASCII.GetBytes("q"));
+			return Benc.Encode(Be.FromDict(root));
+		}
+
+		static void SendTo(byte[] msg, IPEndPoint dest) {
+			if (msg == null || dest == null || VpnHub.Blocked) return;
+			try {
+				UtpHub h = Session.Utp;
+				if (h != null) { h.SendRaw(msg, dest); return; }
+				if (ownVpn != null) { ownVpn.SendTo(msg, dest); return; }
+				if (ownOs != null) ownOs.Send(msg, msg.Length, dest);
+			} catch { }
+		}
+
+		static byte[] ArgBytes(Be a, string key, int n) {
+			if (a == null) return null;
+			Be v = a.Get(key);
+			if (v == null || v.Bytes == null || v.Bytes.Length != n) return null;
+			return v.Bytes;
+		}
+
+		static byte[] NewTid() {
+			byte[] t = new byte[2];
+			RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider();
+			rng.GetBytes(t);
+			rng.Dispose();
+			return t;
+		}
+
+		static string TidKey(byte[] t) { return BitConverter.ToString(t); }
+		static string Hex(byte[] b) { return BitConverter.ToString(b).Replace("-", "").ToLowerInvariant(); }
+
+		static void NoteExternal(byte[] compact) {
+			if (compact == null || compact.Length < 4) return;
+			string s = string.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}.{3}", compact[0], compact[1], compact[2], compact[3]);
+			if (s == appliedIp) return;
+			if (s == voteIp) voteN++;
+			else { voteIp = s; voteN = 1; }
+			if (voteN < 2) return;
+			IPAddress addr = IPAddress.Parse(s);
+			uint crc = Crc32c(addr.GetAddressBytes(), 4);
+			byte[] nid = new byte[20];
+			byte[] cur = id;
+			nid[0] = (byte)(crc >> 24);
+			nid[1] = (byte)(crc >> 16);
+			nid[2] = (byte)(((crc >> 8) & 0xF8u) | (uint)(cur[2] & 7));
+			Buffer.BlockCopy(cur, 3, nid, 3, 17);
+			id = nid;
+			appliedIp = s;
+		}
+
+		public static uint Crc32c(byte[] data, int len) {
+			uint crc = 0xFFFFFFFFu;
+			int n = data == null ? 0 : data.Length;
+			if (len < n) n = len;
+			for (int i = 0; i < n; i++) {
+				crc ^= data[i];
+				for (int b = 0; b < 8; b++) {
+					if ((crc & 1) != 0) crc = (crc >> 1) ^ 0x82F63B78u;
+					else crc >>= 1;
+				}
+			}
+			return ~crc;
+		}
+
+		static byte[] MakeToken(IPAddress addr, byte[] ih, byte[] secret) {
+			byte[] ipb = addr.GetAddressBytes();
+			byte[] buf = new byte[ipb.Length + secret.Length + ih.Length];
+			Buffer.BlockCopy(ipb, 0, buf, 0, ipb.Length);
+			Buffer.BlockCopy(secret, 0, buf, ipb.Length, secret.Length);
+			Buffer.BlockCopy(ih, 0, buf, ipb.Length + secret.Length, ih.Length);
+			byte[] h;
+			using (SHA1CryptoServiceProvider sha = new SHA1CryptoServiceProvider()) h = sha.ComputeHash(buf);
+			byte[] t = new byte[4];
+			Buffer.BlockCopy(h, 0, t, 0, 4);
+			return t;
+		}
+
+		static bool TokenOk(IPAddress addr, byte[] ih, byte[] tok) {
+			return TokenEq(tok, MakeToken(addr, ih, sec0)) || TokenEq(tok, MakeToken(addr, ih, sec1));
+		}
+
+		static bool TokenEq(byte[] a, byte[] b) {
+			if (a == null || b == null || a.Length != b.Length) return false;
+			int d = 0;
+			for (int i = 0; i < a.Length; i++) d |= a[i] ^ b[i];
+			return d == 0;
+		}
+
+		static int XorCmp(byte[] x, byte[] y, byte[] target) {
+			for (int i = 0; i < 20; i++) {
+				int dx = (x[i] ^ target[i]) & 0xff;
+				int dy = (y[i] ^ target[i]) & 0xff;
+				if (dx != dy) return dx - dy;
+			}
+			return 0;
+		}
+	}
+
 	public static class Session {
 		public const int MaxTorrents = 100;
 		public const int GlobalMaxPeers = 500;
@@ -4463,6 +5218,25 @@ namespace PowerTorrent {
 			return Math.Min(want, share);
 		}
 
+		// libtorrent unchoke_slots_limit is 8 for the session. Spread them across running torrents.
+		public static int UnchokeSlots(Engine e) {
+			int n = 0;
+			int idx = -1;
+			lock (gate) {
+				for (int i = 0; i < engines.Count; i++) {
+					Engine en = engines[i];
+					if (en == null || !en.KeepGoing || en.IsPaused) continue;
+					if (en == e) idx = n;
+					n++;
+				}
+			}
+			if (n < 1) n = 1;
+			if (idx < 0) idx = 0;
+			int share = (8 / n) + (idx < (8 % n) ? 1 : 0);
+			if (share < 1) share = 1;
+			return share;
+		}
+
 		public static bool TryBeginPeer() {
 			lock (gate) {
 				if (peerThreads >= GlobalMaxPeers) return false;
@@ -4504,9 +5278,10 @@ namespace PowerTorrent {
 					if (engines[i].Settings.EnableUtp) utp = true;
 					if (boundPort <= 0 && engines[i].Settings.ListenPort > 0) port = engines[i].Settings.ListenPort;
 				}
-				if (engines.Count == 0) { StopListen_NoLock(); return; }
+				if (engines.Count == 0) { StopListen_NoLock(); try { Dht.Attach(0); } catch { } return; }
 			}
-			EnsureListen(port, utp);
+			int bound = EnsureListen(port, utp);
+			try { Dht.Attach(bound); } catch { }
 		}
 
 		public static int EnsureListen(int port, bool enableUtp) {
@@ -4752,6 +5527,23 @@ namespace PowerTorrent {
 		Thread dhtThread;
 		bool sessionReg;
 		int announceInterval = 1800;
+		int annBusy;
+		DateTime nextRechoke = DateTime.MinValue;
+		DateTime lastRechoke = DateTime.MinValue;
+		DateTime optSince = DateTime.MinValue;
+		PeerWorker optPeer;
+		int rechokeNudge;
+		bool toldSeeding;
+		DateTime lastResumeSave = DateTime.MinValue;
+		DateTime nextPex = DateTime.MinValue;
+		Dictionary<string, byte> pexHave = new Dictionary<string, byte>();
+		byte[] pexFull;
+		byte[] pexDiff;
+		bool pexDiffEmpty = true;
+		List<Trk> trk = new List<Trk>();
+		bool trkReady;
+		object trkLock = new object();
+		DateTime lastAnnScan = DateTime.MinValue;
 		bool startedAnnounced;
 		int trackerSeeds;
 		object statusLock = new object();
@@ -4769,6 +5561,17 @@ namespace PowerTorrent {
 		bool v2Only;
 		public int AfterHash;
 		bool hashedThisRun;
+
+		sealed class Trk {
+			public string Url;
+			public DateTime Next;
+			public int Fail;
+			public int Interval = 1800;
+		}
+		sealed class AnnOut {
+			public bool Ok;
+			public int Interval;
+		}
 
 		sealed class FileEnt {
 			public string Path;
@@ -4796,7 +5599,9 @@ namespace PowerTorrent {
 			public bool IsMulti;
 			public byte[] RawInfo;
 			public bool V2;
+			public bool Private;
 			public byte[] V2Hash;
+			public List<List<string>> Tiers = new List<List<string>>();
 			public Dictionary<string, byte[]> PieceLayers = new Dictionary<string, byte[]>();
 
 			public static Meta Stub(string name, byte[] hash, List<string> trackers, List<string> webseeds) {
@@ -4808,6 +5613,11 @@ namespace PowerTorrent {
 				if (trackers != null) {
 					HashSet<string> seenT = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 					for (int i = 0; i < trackers.Count; i++) AddTracker(m, seenT, trackers[i]);
+					if (m.Trackers.Count > 0) {
+						List<string> tier = new List<string>(m.Trackers);
+						Shuffle(tier);
+						m.Tiers.Add(tier);
+					}
 				}
 				if (webseeds != null) {
 					for (int i = 0; i < webseeds.Count; i++) AddWeb(m, webseeds[i]);
@@ -4874,20 +5684,49 @@ namespace PowerTorrent {
 
 				HashSet<string> seenT = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 				string ann = root.Str("announce");
-				AddTracker(m, seenT, ann);
 				Be al = root.Get("announce-list");
 				if (al != null && al.List != null) {
 					for (int t = 0; t < al.List.Count; t++) {
 						Be tier = al.List[t];
+						List<string> urls = new List<string>();
 						if (tier.List != null) {
 							for (int u = 0; u < tier.List.Count; u++) {
-								if (tier.List[u].Bytes != null)
-									AddTracker(m, seenT, Encoding.UTF8.GetString(tier.List[u].Bytes));
+								if (tier.List[u].Bytes == null) continue;
+								string uurl = Encoding.UTF8.GetString(tier.List[u].Bytes).Trim();
+								if (uurl.Length == 0) continue;
+								bool dup = false;
+								for (int k = 0; k < urls.Count; k++) if (string.Equals(urls[k], uurl, StringComparison.OrdinalIgnoreCase)) dup = true;
+								if (!dup) urls.Add(uurl);
 							}
 						} else if (tier.Bytes != null) {
-							AddTracker(m, seenT, Encoding.UTF8.GetString(tier.Bytes));
+							string uurl = Encoding.UTF8.GetString(tier.Bytes).Trim();
+							if (uurl.Length > 0) urls.Add(uurl);
+						}
+						if (urls.Count == 0) continue;
+						Shuffle(urls);
+						m.Tiers.Add(urls);
+						for (int u = 0; u < urls.Count; u++) AddTracker(m, seenT, urls[u]);
+					}
+				}
+				if (!string.IsNullOrEmpty(ann)) {
+					ann = ann.Trim();
+					bool have = false;
+					for (int t = 0; t < m.Tiers.Count && !have; t++) {
+						for (int u = 0; u < m.Tiers[t].Count; u++) {
+							if (string.Equals(m.Tiers[t][u], ann, StringComparison.OrdinalIgnoreCase)) have = true;
 						}
 					}
+					if (!have && ann.Length > 0) {
+						List<string> one = new List<string>();
+						one.Add(ann);
+						m.Tiers.Insert(0, one);
+					}
+					AddTracker(m, seenT, ann);
+				}
+				if (m.Tiers.Count == 0 && m.Trackers.Count > 0) {
+					List<string> one = new List<string>(m.Trackers);
+					Shuffle(one);
+					m.Tiers.Add(one);
 				}
 
 				Be ul = root.Get("url-list");
@@ -4915,6 +5754,7 @@ namespace PowerTorrent {
 				bool haveV1 = piecesBe != null && piecesBe.Bytes != null && piecesBe.Bytes.Length % 20 == 0 && piecesBe.Bytes.Length > 0;
 				if (haveV1) m.PieceHashes = piecesBe.Bytes;
 				if (info.GetInt("meta version", 1) >= 2) m.V2 = true;
+				if (info.GetInt("private", 0) != 0) m.Private = true;
 
 				string saveRoot = savePath;
 				if (string.IsNullOrEmpty(saveRoot)) saveRoot = Directory.GetCurrentDirectory();
@@ -5025,6 +5865,15 @@ namespace PowerTorrent {
 				}
 			}
 
+			static void Shuffle(List<string> xs) {
+				Random rng = new Random(Guid.NewGuid().GetHashCode());
+				for (int i = xs.Count - 1; i > 0; i--) {
+					int j = rng.Next(i + 1);
+					string tmp = xs[i];
+					xs[i] = xs[j];
+					xs[j] = tmp;
+				}
+			}
 			static void AddTracker(Meta m, HashSet<string> seenT, string url) {
 				if (string.IsNullOrEmpty(url)) return;
 				url = url.Trim();
@@ -5278,6 +6127,7 @@ namespace PowerTorrent {
 			}
 
 			void HashOne(int i, byte[] tmp) {
+				if (done[i]) return;
 				if (!PieceMayHaveData(i)) return;
 				int sz = PieceSize(i);
 				bool readOk = true;
@@ -5297,6 +6147,49 @@ namespace PowerTorrent {
 						posInOpen[i] = open.Count;
 						open.Add(i);
 					} else posInOpen[i] = -1;
+				}
+			}
+
+			public void ImportBitfield(byte[] bf) {
+				lock (gate) {
+					doneCount = 0;
+					verified = 0;
+					for (int i = 0; i < n; i++) {
+						bool have = false;
+						if (bf != null) {
+							int bi = i / 8;
+							if (bi < bf.Length) have = (bf[bi] & (1 << (7 - (i % 8)))) != 0;
+						}
+						done[i] = have;
+						if (have) {
+							doneCount++;
+							verified += PieceSize(i);
+						}
+					}
+					RebuildOpen();
+				}
+			}
+
+			public void DropPiecesTouching(int fileIndex) {
+				if (m == null || fileIndex < 0 || fileIndex >= m.Files.Count) return;
+				FileEnt f = m.Files[fileIndex];
+				if (f.Length <= 0 || pieceLen <= 0) return;
+				long start = f.Offset;
+				long end = start + f.Length;
+				int p0 = (int)(start / pieceLen);
+				int p1 = (int)((end - 1) / pieceLen);
+				if (p0 < 0) p0 = 0;
+				if (p1 >= n) p1 = n - 1;
+				lock (gate) {
+					for (int p = p0; p <= p1; p++) {
+						if (!done[p]) continue;
+						done[p] = false;
+						doneCount--;
+						verified -= PieceSize(p);
+					}
+					if (doneCount < 0) doneCount = 0;
+					if (verified < 0) verified = 0;
+					RebuildOpen();
 				}
 			}
 
@@ -5342,9 +6235,9 @@ namespace PowerTorrent {
 							for (int k = 0; k < 32; k++) if (layer[k] != f.PiecesRoot[k]) return false;
 							return true;
 						}
-						return true;
+						return false;
 					}
-					return true;
+					return false;
 				}
 				return false;
 			}
@@ -5497,10 +6390,16 @@ namespace PowerTorrent {
 					buf[piece] = null;
 				}
 				bool ok = VerifyPieceData(piece, pieceData, sz);
+				bool sole = true;
+				lock (gate) {
+					if (hits[piece] != null) {
+						for (int b = 0; b < hits[piece].Length; b++) if (hits[piece][b] != 1) { sole = false; break; }
+					}
+				}
 				if (!ok) {
 					eng.Log(1, "piece " + piece.ToString(CultureInfo.InvariantCulture) + " hash mismatch, retrying");
 					lock (gate) AbortPiece(piece, sz);
-					return 0;
+					return sole ? -1 : 0;
 				}
 				try {
 					IO((long)piece * (long)pieceLen, pieceData, 0, sz, true);
@@ -5704,7 +6603,30 @@ namespace PowerTorrent {
 			double peerBps;
 			int snubHits;
 			bool snubbed;
+			bool amChoking = true;
+			bool theyInterested;
+			int theirListenPort;
+			int strikes;
+			long peerSent;
+			long peerSentLast;
+			DateTime peerUpAt = DateTime.UtcNow;
+			double peerUpBps;
+			IPAddress pexAddr;
+			bool pexInitialSent;
+			DateTime lastPexAt = DateTime.MinValue;
+			DateTime lastPexRx = DateTime.MinValue;
 			public bool IsSeed { get { return theySeed; } }
+			public bool Interested { get { return theyInterested; } }
+			public bool Choking { get { return amChoking; } }
+			public double DownRate { get { return peerBps; } }
+			public double UpRate { get { return peerUpBps; } }
+
+			void NotePex(IPEndPoint ep) {
+				if (ep == null || ep.Address == null) return;
+				host = ep.Address.ToString();
+				port = ep.Port;
+				pexAddr = ep.Address;
+			}
 
 			public PeerWorker(Engine eng, PeerIo ready) {
 				this.eng = eng;
@@ -5712,12 +6634,15 @@ namespace PowerTorrent {
 				incoming = true;
 				host = "incoming";
 				port = 0;
+				if (ready != null) NotePex(ready.Remote);
 			}
 			public PeerWorker(Engine eng, string host, int port) {
 				this.eng = eng;
 				this.host = host;
 				this.port = port;
 				incoming = false;
+				IPAddress ip;
+				if (IPAddress.TryParse(host, out ip)) pexAddr = ip;
 			}
 			public PeerWorker(Engine eng, TcpClient c) {
 				this.eng = eng;
@@ -5753,8 +6678,8 @@ namespace PowerTorrent {
 					if (eng.pieces != null) {
 						SendBitfield();
 						SendInterested();
-						SendUnchoke();
 					}
+					eng.NudgeRechoke();
 					lastRecv = DateTime.UtcNow;
 					byte[] lenBuf = new byte[4];
 					while (eng.running && !eng.paused) {
@@ -5816,7 +6741,7 @@ namespace PowerTorrent {
 					pendingHaves.Clear();
 					SendBitfield();
 					SendInterested();
-					SendUnchoke();
+					eng.NudgeRechoke();
 					if (theyExt) SendExtHandshake();
 				} catch { }
 			}
@@ -5828,33 +6753,77 @@ namespace PowerTorrent {
 					TcpPeerIo tio = new TcpPeerIo(tcp);
 					if (!tio.AcceptMseOrPlain(eng.infoHash, eng.settings.EnableEncrypt)) return false;
 					io = tio;
+					NotePex(tio.Remote);
 					return Handshake();
 				}
-				TcpPeerIo dio = TcpPeerIo.Dial(host, port, 4000);
-				if (dio != null) {
-					if (eng.settings.EnableEncrypt) {
-						if (dio.TryMseOutgoing(eng.infoHash)) {
-							io = dio;
-							return Handshake();
-						}
-						dio.Close();
-						dio = TcpPeerIo.Dial(host, port, 4000);
+				object dialGate = new object();
+				TcpPeerIo tcpWin = null;
+				bool tcpFinished = false;
+				int pick = 0;
+				Thread th = new Thread(delegate() {
+					TcpPeerIo d = TcpPeerIo.Dial(host, port, 4000);
+					lock (dialGate) {
+						tcpFinished = true;
+						if (d == null) return;
+						if (pick == 2) { try { d.Close(); } catch { } return; }
+						tcpWin = d;
 					}
-					if (dio != null) {
+				});
+				th.IsBackground = true;
+				th.Name = "pt-dial";
+				th.Start();
+				UtpConn utp = null;
+				bool allowUtp = eng.settings.EnableUtp && Session.Utp != null && (VpnHub.TunnelOn || VpnHub.OsAllowed);
+				if (allowUtp) {
+					try { utp = Session.Utp.Connect(host, port, 1200); } catch { utp = null; }
+				}
+				DateTime until = DateTime.UtcNow.AddMilliseconds(utp != null ? 400 : 3800);
+				while (DateTime.UtcNow < until) {
+					bool done;
+					lock (dialGate) done = tcpFinished;
+					if (done) break;
+					Thread.Sleep(20);
+				}
+				TcpPeerIo got = null;
+				lock (dialGate) {
+					if (tcpWin != null) {
+						pick = 1;
+						got = tcpWin;
+						tcpWin = null;
+					} else if (utp != null) pick = 2;
+				}
+				if (got != null) {
+					if (utp != null) { try { utp.Close(); } catch { } }
+					return FinishTcp(got);
+				}
+				if (pick == 2 && utp != null) {
+					io = new UtpPeerIo(utp);
+					if (utp.Remote != null) NotePex(utp.Remote);
+					return Handshake();
+				}
+				try { th.Join(4200); } catch { }
+				lock (dialGate) {
+					if (tcpWin != null) { got = tcpWin; tcpWin = null; }
+				}
+				if (got != null) return FinishTcp(got);
+				return false;
+			}
+
+			bool FinishTcp(TcpPeerIo dio) {
+				if (dio == null) return false;
+				NotePex(dio.Remote);
+				if (eng.settings.EnableEncrypt) {
+					if (dio.TryMseOutgoing(eng.infoHash)) {
 						io = dio;
 						return Handshake();
 					}
+					try { dio.Close(); } catch { }
+					dio = TcpPeerIo.Dial(host, port, 4000);
+					if (dio == null) return false;
+					NotePex(dio.Remote);
 				}
-				if (!VpnHub.TunnelOn && VpnHub.OsAllowed && Session.Utp != null && eng.settings.EnableUtp) {
-					try {
-						UtpConn uc = Session.Utp.Connect(host, port, 2000);
-						if (uc != null) {
-							io = new UtpPeerIo(uc);
-							return Handshake();
-						}
-					} catch { }
-				}
-				return false;
+				io = dio;
+				return Handshake();
 			}
 
 			bool Handshake() {
@@ -5915,6 +6884,69 @@ namespace PowerTorrent {
 				msg[4] = 1;
 				WriteAll(msg);
 			}
+			void SendChoke() {
+				byte[] msg = new byte[5];
+				Bt.W32(msg, 0, 1);
+				msg[4] = 0;
+				WriteAll(msg);
+			}
+			void SendNotInterested() {
+				byte[] msg = new byte[5];
+				Bt.W32(msg, 0, 1);
+				msg[4] = 3;
+				WriteAll(msg);
+			}
+			public void SetChoked(bool choke) {
+				if (choke == amChoking) return;
+				amChoking = choke;
+				try {
+					if (choke) SendChoke();
+					else SendUnchoke();
+				} catch { }
+			}
+			public void MarkNotInterested() {
+				try { SendNotInterested(); } catch { }
+			}
+			void NoteUp(int n) {
+				peerSent += n;
+				DateTime now = DateTime.UtcNow;
+				double dt = (now - peerUpAt).TotalSeconds;
+				if (dt < 0.4) return;
+				double inst = (peerSent - peerSentLast) / Math.Max(dt, 0.001);
+				if (peerUpBps < 32) peerUpBps = inst;
+				else peerUpBps = peerUpBps * 0.5 + inst * 0.5;
+				peerSentLast = peerSent;
+				peerUpAt = now;
+			}
+			public string PexEndpoint() {
+				if (pexAddr == null) return null;
+				int p = incoming ? theirListenPort : port;
+				if (p <= 0 || p > 65535) return null;
+				string num = p.ToString(CultureInfo.InvariantCulture);
+				if (pexAddr.AddressFamily == AddressFamily.InterNetwork) return pexAddr.ToString() + ":" + num;
+				return "[" + pexAddr.ToString() + "]:" + num;
+			}
+			public byte PexFlags() {
+				byte f = 0;
+				if (io != null && io.Transport != null && io.Transport.IndexOf("MSE", StringComparison.Ordinal) >= 0) f |= 1;
+				if (theySeed) f |= 2;
+				if (io != null && io.Transport == "uTP") f |= 4;
+				return f;
+			}
+			public void SendPex(byte[] fullPayload, byte[] diffPayload, bool diffEmpty) {
+				if (theirUtPex <= 0) return;
+				DateTime now = DateTime.UtcNow;
+				if ((now - lastPexAt).TotalSeconds < 60) return;
+				lastPexAt = now;
+				try {
+					if (!pexInitialSent) {
+						if (fullPayload != null) SendExt(theirUtPex, fullPayload);
+						pexInitialSent = true;
+					} else if (!diffEmpty && diffPayload != null) {
+						SendExt(theirUtPex, diffPayload);
+					}
+				} catch { }
+			}
 			void SendHave(int piece) {
 				byte[] msg = new byte[9];
 				Bt.W32(msg, 0, 5);
@@ -5934,11 +6966,11 @@ namespace PowerTorrent {
 			void SendExtHandshake() {
 				Dictionary<string, Be> m = new Dictionary<string, Be>();
 				m["ut_metadata"] = Be.Int(1);
-				m["ut_pex"] = Be.Int(2);
+				if (eng.meta == null || !eng.meta.Private) m["ut_pex"] = Be.Int(2);
 				Dictionary<string, Be> root = new Dictionary<string, Be>();
 				root["m"] = Be.FromDict(m);
 				if (eng.boundPort > 0) root["p"] = Be.Int(eng.boundPort);
-				root["v"] = Be.Blob(Encoding.UTF8.GetBytes("PowerTorrent/1.2"));
+				root["v"] = Be.Blob(Encoding.UTF8.GetBytes("PowerTorrent/1.4"));
 				if (eng.settings.EnableEncrypt) root["e"] = Be.Int(1);
 				if (eng.rawInfo != null) root["metadata_size"] = Be.Int(eng.rawInfo.Length);
 				SendExt(0, Benc.Encode(Be.FromDict(root)));
@@ -6050,6 +7082,7 @@ namespace PowerTorrent {
 				Buffer.BlockCopy(data, 0, msg, 13, data.Length);
 				WriteAll(msg);
 				eng.AddSessionUp(data.Length);
+				NoteUp(data.Length);
 			}
 
 			void Handle(byte[] msg) {
@@ -6061,7 +7094,11 @@ namespace PowerTorrent {
 				} else if (id == 1) {
 					amChoked = false;
 				} else if (id == 2) {
-					SendUnchoke();
+					theyInterested = true;
+					eng.NudgeRechoke();
+				} else if (id == 3) {
+					theyInterested = false;
+					if (!amChoking) SetChoked(true);
 				} else if (id == 4 && msg.Length >= 5) {
 					int idx = Bt.R32(msg, 1);
 					if (eng.pieces == null) {
@@ -6082,7 +7119,7 @@ namespace PowerTorrent {
 						if (eng.pieces.PeerHasSomethingWeNeed(their)) SendInterested();
 					}
 				} else if (id == 6 && msg.Length >= 13) {
-					if (eng.pieces == null) return;
+					if (amChoking || eng.pieces == null) return;
 					int idx = Bt.R32(msg, 1);
 					int begin = Bt.R32(msg, 5);
 					int len = Bt.R32(msg, 9);
@@ -6109,6 +7146,14 @@ namespace PowerTorrent {
 					}
 					if (eng.pieces == null) return;
 					int stored = eng.pieces.Submit(idx, begin, msg, 9, dlen);
+					if (stored < 0) {
+						strikes++;
+						if (strikes >= 2) {
+							eng.Log(1, "dropping " + host + ":" + port.ToString(CultureInfo.InvariantCulture) + " after bad pieces");
+							try { Kill(); } catch { }
+						}
+						return;
+					}
 					if (stored == 0) {
 						if (match) eng.pieces.Unclaim(idx, begin);
 						else if (eng.pieces.BlockDone(idx, begin)) eng.BroadcastCancel(idx, begin, this);
@@ -6136,6 +7181,8 @@ namespace PowerTorrent {
 						theirUtMeta = (int)m.GetInt("ut_metadata", 0);
 						theirUtPex = (int)m.GetInt("ut_pex", 0);
 					}
+					int lp = (int)d.GetInt("p", 0);
+					if (lp > 0 && lp < 65536) theirListenPort = lp;
 					int msz = (int)d.GetInt("metadata_size", 0);
 					if (msz > 0 && !eng.infoReady) eng.OfferMetaSize(msz);
 				} else if (ext == 1) {
@@ -6159,16 +7206,19 @@ namespace PowerTorrent {
 						lastMetaIdx = -1;
 					}
 				} else if (ext == 2) {
+					if (eng.meta != null && eng.meta.Private) return;
+					if ((DateTime.UtcNow - lastPexRx).TotalSeconds < 30) return;
+					lastPexRx = DateTime.UtcNow;
 					int consumed;
 					Be d = Benc.DecodeAt(msg, 2, out consumed);
 					if (d == null || d.Dict == null) return;
+					List<string> tmp = new List<string>();
 					Be added = d.Get("added");
-					if (added != null && added.Bytes != null) {
-						List<string> tmp = new List<string>();
-						Bt.AddCompactPeers(added.Bytes, tmp);
-						for (int i = 0; i < tmp.Count; i++) eng.RememberPeer(tmp[i]);
-						if (tmp.Count > 0) eng.Log(2, "PEX +" + tmp.Count.ToString(CultureInfo.InvariantCulture) + " from " + host);
-					}
+					if (added != null && added.Bytes != null) Bt.AddCompactPeers(added.Bytes, tmp);
+					Be added6 = d.Get("added6");
+					if (added6 != null && added6.Bytes != null) Bt.AddCompact6(added6.Bytes, tmp);
+					for (int i = 0; i < tmp.Count; i++) eng.RememberPeer(tmp[i]);
+					if (tmp.Count > 0) eng.Log(2, "PEX +" + tmp.Count.ToString(CultureInfo.InvariantCulture) + " from " + host);
 				}
 			}
 
@@ -6467,7 +7517,7 @@ namespace PowerTorrent {
 			if (settings.MaxPeers <= 0) settings.MaxPeers = 80;
 			if (settings.ListenPort <= 0) settings.ListenPort = 6881;
 			if (!running) return;
-			if (settings.EnableDht) {
+			if (settings.EnableDht && (meta == null || !meta.Private)) {
 				Thread t = dhtThread;
 				if (t == null || !t.IsAlive) {
 					dhtThread = new Thread(DhtRun);
@@ -6478,6 +7528,7 @@ namespace PowerTorrent {
 			}
 			Session.EnsureListen(settings.ListenPort, settings.EnableUtp);
 			if (boundPort <= 0) boundPort = Session.BoundPort;
+			if (boundPort > 0) Dht.Attach(boundPort);
 		}
 
 		public void Stop() {
@@ -6494,6 +7545,8 @@ namespace PowerTorrent {
 			if (coordThread != null && Thread.CurrentThread != coordThread) {
 				try { coordThread.Join(3000); } catch { }
 			}
+			try { SaveResume(); } catch { }
+			if (infoHash != null) Dht.Unwant(infoHash);
 			if (pieces != null) pieces.Close();
 			if (sessionReg) {
 				Session.Unregister(this);
@@ -6759,6 +7812,19 @@ namespace PowerTorrent {
 				VpnHub.Require = oldReq;
 				string vpnFail = VpnHub.SelfCheck();
 				if (vpnFail != null) return "vpn-" + vpnFail;
+				string dhtFail = Dht.SelfCheck();
+				if (dhtFail != null) return "dht-" + dhtFail;
+				if (Session.UnchokeSlots(null) != 8) return "unchoke-slots";
+				byte[] pexA, pexF, pexA6, pexF6;
+				List<string> pexEps = new List<string>();
+				pexEps.Add("1.2.3.4:6881");
+				List<byte> pexFlags = new List<byte>();
+				pexFlags.Add(2);
+				PackEnds(pexEps, pexFlags, out pexA, out pexF, out pexA6, out pexF6);
+				if (pexA == null || pexA.Length != 6 || pexA[0] != 1 || pexA[4] != 0x1A || pexA[5] != 0xE1 || pexF.Length != 1 || pexF[0] != 2) return "pex";
+				if (OvpnSess.PickCipher("AES-256-CBC", "AES-128-GCM:AES-256-GCM") != "AES-256-GCM") return "ovpn-ciphers";
+				if (OvpnSess.PickCipher("AES-256-CBC", null) != "AES-256-CBC") return "ovpn-cipher";
+				if (OvpnSess.PickCipher(null, "AES-128-GCM") != null) return "ovpn-no-gcm";
 				return null;
 			} catch (Exception ex) {
 				return ex.ToString();
@@ -6796,14 +7862,135 @@ namespace PowerTorrent {
 				status.PiecesDone = 0;
 				status.PiecesTotal = meta != null ? meta.PieceCount : 0;
 			}
-			Log(1, "checking existing pieces...");
+			long[] lens;
+			long[] ticks;
+			bool[] dirty;
+			bool resumeOk = ResumeMatches(out lens, out ticks, out dirty);
 			pieces.Open(AfterHash != 2);
+			if (resumeOk) {
+				byte[] bits = ReadResumeBits();
+				if (bits == null) resumeOk = false;
+			}
+			if (resumeOk) {
+				byte[] bits = ReadResumeBits();
+				pieces.ImportBitfield(bits);
+				bool anyDirty = false;
+				if (dirty != null) {
+					for (int i = 0; i < dirty.Length; i++) if (dirty[i]) { anyDirty = true; pieces.DropPiecesTouching(i); }
+				}
+				if (!anyDirty) {
+					hashedThisRun = true;
+					int dc0, tot0; long ver0, totb0;
+					pieces.Snapshot(out dc0, out tot0, out ver0, out totb0);
+					Log(1, "resume " + dc0.ToString(CultureInfo.InvariantCulture) + "/" + tot0.ToString(CultureInfo.InvariantCulture) + " pieces (" + Fmt(ver0) + ")");
+					SaveResume();
+					return;
+				}
+				Log(1, "resume changed, rechecking");
+			} else {
+				Log(1, "checking existing pieces...");
+			}
 			pieces.HashCheck();
 			if (!running) return;
 			hashedThisRun = true;
-			int dc0, tot0; long ver0, totb0;
-			pieces.Snapshot(out dc0, out tot0, out ver0, out totb0);
-			Log(1, "have " + dc0.ToString(CultureInfo.InvariantCulture) + "/" + tot0.ToString(CultureInfo.InvariantCulture) + " pieces (" + Fmt(ver0) + ")");
+			int dc1, tot1; long ver1, totb1;
+			pieces.Snapshot(out dc1, out tot1, out ver1, out totb1);
+			Log(1, "have " + dc1.ToString(CultureInfo.InvariantCulture) + "/" + tot1.ToString(CultureInfo.InvariantCulture) + " pieces (" + Fmt(ver1) + ")");
+			SaveResume();
+		}
+
+		string ResumePath() {
+			if (meta == null || string.IsNullOrEmpty(meta.InfoHashHex)) return null;
+			string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PowerTorrent", "resume");
+			return Path.Combine(dir, meta.InfoHashHex + ".resume");
+		}
+
+		static void FileStamp(string path, out long len, out long ticks) {
+			len = -1;
+			ticks = 0;
+			try {
+				if (!File.Exists(path)) return;
+				FileInfo fi = new FileInfo(path);
+				len = fi.Length;
+				ticks = fi.LastWriteTimeUtc.Ticks;
+			} catch { }
+		}
+
+		bool ResumeMatches(out long[] lens, out long[] ticks, out bool[] dirty) {
+			lens = null;
+			ticks = null;
+			dirty = null;
+			if (meta == null || meta.Files == null) return false;
+			int nf = meta.Files.Count;
+			lens = new long[nf];
+			ticks = new long[nf];
+			dirty = new bool[nf];
+			string path = ResumePath();
+			if (path == null || !File.Exists(path)) {
+				for (int i = 0; i < nf; i++) dirty[i] = true;
+				return false;
+			}
+			try {
+				string[] lines = File.ReadAllLines(path);
+				if (lines.Length < 3 || lines[0] != "PT1") return false;
+				int pc;
+				int fc;
+				if (!int.TryParse(lines[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out pc)) return false;
+				if (!int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out fc)) return false;
+				if (pc != meta.PieceCount || fc != nf) return false;
+				if (lines.Length < 3 + fc + 1) return false;
+				for (int i = 0; i < nf; i++) {
+					FileStamp(meta.Files[i].Path, out lens[i], out ticks[i]);
+					string[] parts = lines[3 + i].Split('\t');
+					if (parts.Length < 2) { dirty[i] = true; continue; }
+					long rl, rt;
+					if (!long.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out rl)) { dirty[i] = true; continue; }
+					if (!long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out rt)) { dirty[i] = true; continue; }
+					dirty[i] = rl != lens[i] || rt != ticks[i];
+				}
+				return true;
+			} catch { return false; }
+		}
+
+		byte[] ReadResumeBits() {
+			try {
+				string path = ResumePath();
+				if (path == null || !File.Exists(path)) return null;
+				string[] lines = File.ReadAllLines(path);
+				int fc;
+				if (lines.Length < 4 || !int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out fc)) return null;
+				int at = 3 + fc;
+				if (at >= lines.Length) return null;
+				return Convert.FromBase64String(lines[at].Trim());
+			} catch { return null; }
+		}
+
+		void SaveResume() {
+			if (meta == null || pieces == null || meta.Files == null) return;
+			string path = ResumePath();
+			if (path == null) return;
+			try {
+				string dir = Path.GetDirectoryName(path);
+				if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+				StringBuilder sb = new StringBuilder();
+				sb.Append("PT1\n");
+				sb.Append(meta.PieceCount.ToString(CultureInfo.InvariantCulture));
+				sb.Append('\n');
+				sb.Append(meta.Files.Count.ToString(CultureInfo.InvariantCulture));
+				sb.Append('\n');
+				for (int i = 0; i < meta.Files.Count; i++) {
+					long len, ticks;
+					FileStamp(meta.Files[i].Path, out len, out ticks);
+					sb.Append(len.ToString(CultureInfo.InvariantCulture));
+					sb.Append('\t');
+					sb.Append(ticks.ToString(CultureInfo.InvariantCulture));
+					sb.Append('\n');
+				}
+				sb.Append(Convert.ToBase64String(pieces.MakeBitfield()));
+				sb.Append('\n');
+				File.WriteAllText(path, sb.ToString());
+				lastResumeSave = DateTime.UtcNow;
+			} catch { }
 		}
 
 		bool ApplyAfterHash() {
@@ -6954,6 +8141,7 @@ namespace PowerTorrent {
 			}
 			meta = loaded;
 			rawInfo = fetchedInfo;
+			lock (trkLock) { trk.Clear(); trkReady = false; }
 			pieces = new PieceMgr(this, meta);
 			status.Name = meta.Name;
 			Log(1, "torrent: " + meta.Name + " (" + Fmt(meta.TotalSize) + ", " + meta.PieceCount.ToString(CultureInfo.InvariantCulture) + " pieces)");
@@ -6970,6 +8158,8 @@ namespace PowerTorrent {
 			if (url.Length == 0) return;
 			if (!seenT.Add(url)) return;
 			m.Trackers.Add(url);
+			if (m.Tiers.Count == 0) m.Tiers.Add(new List<string>());
+			m.Tiers[m.Tiers.Count - 1].Add(url);
 		}
 
 		void RememberPeer(string ep) {
@@ -7066,7 +8256,7 @@ namespace PowerTorrent {
 						AnnounceAll("started");
 						startedAnnounced = true;
 					}
-					if (settings.EnableDht) {
+					if (settings.EnableDht && (meta == null || !meta.Private)) {
 						dhtThread = new Thread(DhtRun);
 						dhtThread.IsBackground = true;
 						dhtThread.Start();
@@ -7089,7 +8279,7 @@ namespace PowerTorrent {
 					if (!ApplyAfterHash()) return;
 				}
 
-				if (settings.EnableDht && dhtThread == null) {
+				if (settings.EnableDht && (meta == null || !meta.Private) && (dhtThread == null || !dhtThread.IsAlive)) {
 					dhtThread = new Thread(DhtRun);
 					dhtThread.IsBackground = true;
 					dhtThread.Start();
@@ -7115,7 +8305,6 @@ namespace PowerTorrent {
 					Log(1, "webseeds: " + meta.Webseeds.Count.ToString(CultureInfo.InvariantCulture) + " (" + wn.ToString(CultureInfo.InvariantCulture) + " workers)");
 				}
 
-				DateTime lastAnn = DateTime.UtcNow;
 				lastSp = DateTime.UtcNow;
 				if (pieces != null) pieces.RefreshBudget();
 				while (running) {
@@ -7142,12 +8331,21 @@ namespace PowerTorrent {
 					UpdateSpeed();
 					RecyclePeers();
 					FillPeers();
+					RechokeIfDue();
+					TickPex();
+					if ((DateTime.UtcNow - lastResumeSave).TotalSeconds >= 30) SaveResume();
 					if (pieces.IsComplete) {
 						if (settings.SeedAfterComplete) {
 							lock (statusLock) {
 								if (status.State != "Seeding") {
 									status.State = "Seeding";
 									Log(1, "download complete, seeding");
+									if (!toldSeeding) {
+										toldSeeding = true;
+										PeerWorker[] snapSeed;
+										lock (peerLock) snapSeed = peers.ToArray();
+										for (int si = 0; si < snapSeed.Length; si++) snapSeed[si].MarkNotInterested();
+									}
 									ThreadPool.QueueUserWorkItem(delegate { try { AnnounceAll("completed"); } catch { } });
 								}
 							}
@@ -7163,8 +8361,8 @@ namespace PowerTorrent {
 							if (status.State != "Hashing") status.State = "Downloading";
 						}
 					}
-					if ((DateTime.UtcNow - lastAnn).TotalSeconds >= announceInterval) {
-						lastAnn = DateTime.UtcNow;
+					if ((DateTime.UtcNow - lastAnnScan).TotalSeconds >= 5) {
+						lastAnnScan = DateTime.UtcNow;
 						ThreadPool.QueueUserWorkItem(delegate { try { AnnounceAll(""); } catch { } });
 					}
 					Thread.Sleep(VpnHub.TunnelOn ? 25 : 50);
@@ -7176,6 +8374,150 @@ namespace PowerTorrent {
 				}
 				Log(0, "engine error: " + ex.Message);
 			}
+		}
+
+		void NudgeRechoke() {
+			Interlocked.Exchange(ref rechokeNudge, 1);
+		}
+
+		void RechokeIfDue() {
+			bool nudge = Interlocked.Exchange(ref rechokeNudge, 0) == 1;
+			DateTime now = DateTime.UtcNow;
+			if (!nudge && (now - lastRechoke).TotalSeconds < 15) return;
+			if (nudge && (now - lastRechoke).TotalSeconds < 1) {
+				Interlocked.Exchange(ref rechokeNudge, 1);
+				return;
+			}
+			lastRechoke = now;
+			Rechoke();
+		}
+
+		// Fixed slots, one of them optimistic. Seeds prefer the fastest downloaders (qBittorrent's default).
+		void Rechoke() {
+			if (pieces == null) return;
+			PeerWorker[] snap;
+			lock (peerLock) snap = peers.ToArray();
+			bool seeding = pieces.IsComplete;
+			List<PeerWorker> cand = new List<PeerWorker>();
+			for (int i = 0; i < snap.Length; i++) {
+				if (!snap[i].Interested) {
+					if (!snap[i].Choking) snap[i].SetChoked(true);
+					continue;
+				}
+				cand.Add(snap[i]);
+			}
+			int slots = Session.UnchokeSlots(this);
+			int rateSlots = slots > 0 ? slots - 1 : 0;
+			cand.Sort(delegate(PeerWorker a, PeerWorker b) {
+				double da = seeding ? a.UpRate : a.DownRate;
+				double db = seeding ? b.UpRate : b.DownRate;
+				if (da == db) return 0;
+				return db.CompareTo(da);
+			});
+			bool still = false;
+			for (int i = 0; i < cand.Count; i++) if (cand[i] == optPeer) still = true;
+			bool rotate = optPeer == null || !still || (DateTime.UtcNow - optSince).TotalSeconds >= 30;
+			if (rotate) {
+				List<PeerWorker> pool = new List<PeerWorker>();
+				for (int i = rateSlots; i < cand.Count; i++) pool.Add(cand[i]);
+				if (pool.Count == 0 && cand.Count > 0) pool.Add(cand[cand.Count - 1]);
+				if (pool.Count > 0) {
+					optPeer = pool[new Random().Next(pool.Count)];
+					optSince = DateTime.UtcNow;
+				} else optPeer = null;
+			}
+			for (int i = 0; i < cand.Count; i++) {
+				bool unchoke = i < rateSlots || cand[i] == optPeer;
+				cand[i].SetChoked(!unchoke);
+			}
+		}
+
+		void TickPex() {
+			if (meta != null && meta.Private) return;
+			if (nextPex == DateTime.MinValue) { nextPex = DateTime.UtcNow.AddSeconds(60); return; }
+			if (DateTime.UtcNow < nextPex) return;
+			nextPex = DateTime.UtcNow.AddSeconds(60);
+			PeerWorker[] snap;
+			lock (peerLock) snap = peers.ToArray();
+			Dictionary<string, byte> nowSet = new Dictionary<string, byte>();
+			for (int i = 0; i < snap.Length; i++) {
+				string ep = snap[i].PexEndpoint();
+				if (string.IsNullOrEmpty(ep) || nowSet.ContainsKey(ep)) continue;
+				nowSet[ep] = snap[i].PexFlags();
+			}
+			List<string> added = new List<string>();
+			List<byte> addedF = new List<byte>();
+			List<string> dropped = new List<string>();
+			foreach (KeyValuePair<string, byte> kv in nowSet) {
+				if (pexHave.ContainsKey(kv.Key)) continue;
+				if (added.Count >= 100) continue;
+				added.Add(kv.Key);
+				addedF.Add(kv.Value);
+			}
+			foreach (KeyValuePair<string, byte> kv in pexHave) {
+				if (!nowSet.ContainsKey(kv.Key)) dropped.Add(kv.Key);
+			}
+			pexHave = nowSet;
+			List<string> fullE = new List<string>();
+			List<byte> fullF = new List<byte>();
+			foreach (KeyValuePair<string, byte> kv in nowSet) {
+				if (fullE.Count >= 100) break;
+				fullE.Add(kv.Key);
+				fullF.Add(kv.Value);
+			}
+			pexFull = BuildPex(fullE, fullF, new List<string>());
+			pexDiff = BuildPex(added, addedF, dropped);
+			pexDiffEmpty = added.Count == 0 && dropped.Count == 0;
+			for (int i = 0; i < snap.Length; i++) snap[i].SendPex(pexFull, pexDiff, pexDiffEmpty);
+		}
+
+		static byte[] BuildPex(List<string> added, List<byte> addedF, List<string> dropped) {
+			byte[] a4, f4, a6, f6, d4, d6, ignore4, ignore6;
+			PackEnds(added, addedF, out a4, out f4, out a6, out f6);
+			PackEnds(dropped, null, out d4, out ignore4, out d6, out ignore6);
+			Dictionary<string, Be> d = new Dictionary<string, Be>();
+			d["added"] = Be.Blob(a4);
+			d["added.f"] = Be.Blob(f4);
+			d["added6"] = Be.Blob(a6);
+			d["added6.f"] = Be.Blob(f6);
+			d["dropped"] = Be.Blob(d4);
+			d["dropped6"] = Be.Blob(d6);
+			return Benc.Encode(Be.FromDict(d));
+		}
+
+		static void PackEnds(List<string> eps, List<byte> flags, out byte[] v4, out byte[] f4, out byte[] v6, out byte[] f6) {
+			List<byte> a = new List<byte>();
+			List<byte> fa = new List<byte>();
+			List<byte> b = new List<byte>();
+			List<byte> fb = new List<byte>();
+			if (eps != null) {
+				for (int i = 0; i < eps.Count; i++) {
+					byte fl = (flags != null && i < flags.Count) ? flags[i] : (byte)0;
+					string ep = eps[i];
+					if (string.IsNullOrEmpty(ep)) continue;
+					int colon = ep.LastIndexOf(':');
+					if (colon <= 0) continue;
+					string h = ep.Substring(0, colon);
+					int p;
+					if (!int.TryParse(ep.Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out p)) continue;
+					if (p <= 0 || p > 65535) continue;
+					if (h.Length >= 2 && h[0] == '[') h = h.Substring(1, h.Length - 2);
+					IPAddress ip;
+					if (!IPAddress.TryParse(h, out ip)) continue;
+					byte[] raw = ip.GetAddressBytes();
+					List<byte> dst = raw.Length == 16 ? b : a;
+					List<byte> fd = raw.Length == 16 ? fb : fa;
+					if (raw.Length != 4 && raw.Length != 16) continue;
+					for (int k = 0; k < raw.Length; k++) dst.Add(raw[k]);
+					dst.Add((byte)(p >> 8));
+					dst.Add((byte)p);
+					fd.Add(fl);
+				}
+			}
+			v4 = a.ToArray();
+			f4 = fa.ToArray();
+			v6 = b.ToArray();
+			f6 = fb.ToArray();
 		}
 
 		void FillPeers() {
@@ -7192,12 +8534,14 @@ namespace PowerTorrent {
 				}
 				string ep = NextPeer();
 				if (ep == null) return;
-				string[] parts = ep.Split(':');
-				if (parts.Length != 2) continue;
+				int colon = ep.LastIndexOf(':');
+				if (colon <= 0) continue;
+				string h = ep.Substring(0, colon);
+				if (h.Length >= 2 && h[0] == '[') h = h.Substring(1, h.Length - 2);
 				int p;
-				if (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out p)) continue;
+				if (!int.TryParse(ep.Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out p)) continue;
 				if (p <= 0 || p > 65535) continue;
-				StartOutgoing(parts[0], p);
+				StartOutgoing(h, p);
 			}
 		}
 
@@ -7225,11 +8569,12 @@ namespace PowerTorrent {
 				Log(1, "listening on TCP " + boundPort.ToString(CultureInfo.InvariantCulture)
 					+ (Session.Utp != null ? " / UDP" : "")
 					+ (VpnHub.TunnelOn ? " (VPN)" : ""));
-				return;
+			} else {
+				boundPort = settings.ListenPort;
+				if (VpnHub.Blocked) Log(1, "VPN down: not listening");
+				else Log(1, "could not bind a listen port; outgoing connections only");
 			}
-			boundPort = settings.ListenPort;
-			if (VpnHub.Blocked) Log(1, "VPN down: not listening");
-			else Log(1, "could not bind a listen port; outgoing connections only");
+			if (boundPort > 0 && (meta == null || !meta.Private)) Dht.Attach(boundPort);
 		}
 
 		static void SendUdp(VpnUdpSock vs, UdpClient udp, byte[] req, IPEndPoint dest) {
@@ -7246,50 +8591,100 @@ namespace PowerTorrent {
 			return udp.Receive(ref ep);
 		}
 
-		void AnnounceAll(string ev) {
-			List<string> urls = meta.Trackers;
-			if (urls.Count == 0) {
-				Log(1, "no trackers in torrent");
-				return;
-			}
-			List<string> collected = new List<string>();
-			int remaining = urls.Count;
-			ManualResetEvent done = new ManualResetEvent(false);
-			for (int i = 0; i < urls.Count; i++) {
-				ThreadPool.QueueUserWorkItem(delegate(object state) {
-					string u = (string)state;
-					try {
-						List<string> local = new List<string>();
-						string scheme = "";
-						try { scheme = new Uri(u).Scheme.ToLowerInvariant(); } catch { }
-						if (scheme == "udp") QueryUdp(u, ev, local);
-						else if (scheme == "http" || scheme == "https") QueryHttp(u, ev, local);
-						else Log(2, "skip tracker " + u);
-						lock (collected) {
-							for (int k = 0; k < local.Count; k++) collected.Add(local[k]);
-						}
-						if (local.Count > 0)
-							Log(1, local.Count.ToString(CultureInfo.InvariantCulture) + " peers from " + u);
-					} catch (Exception ex) {
-						Log(2, "tracker " + u + " " + ex.Message);
-					} finally {
-						if (Interlocked.Decrement(ref remaining) == 0) done.Set();
+		void EnsureTrackers() {
+			if (trkReady || meta == null) return;
+			lock (trkLock) {
+				if (trkReady) return;
+				List<string> urls = new List<string>();
+				if (meta.Tiers != null && meta.Tiers.Count > 0) {
+					for (int t = 0; t < meta.Tiers.Count; t++) {
+						if (meta.Tiers[t] == null) continue;
+						for (int u = 0; u < meta.Tiers[t].Count; u++) urls.Add(meta.Tiers[t][u]);
 					}
-				}, urls[i]);
-			}
-			done.WaitOne(ev == "stopped" ? 2000 : 18000);
-			lock (collected) {
-				for (int i = 0; i < collected.Count; i++) RememberPeer(collected[i]);
+				} else if (meta.Trackers != null) {
+					for (int i = 0; i < meta.Trackers.Count; i++) urls.Add(meta.Trackers[i]);
+				}
+				HashSet<string> seenU = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+				for (int i = 0; i < urls.Count; i++) {
+					if (string.IsNullOrEmpty(urls[i]) || !seenU.Add(urls[i])) continue;
+					Trk tr = new Trk();
+					tr.Url = urls[i];
+					tr.Next = DateTime.UtcNow;
+					trk.Add(tr);
+				}
+				trkReady = true;
 			}
 		}
 
-		void QueryUdp(string url, string ev, List<string> peersOut) {
+		void AnnounceAll(string ev) {
+			if (meta == null) return;
+			bool periodic = string.IsNullOrEmpty(ev);
+			if (periodic && Interlocked.CompareExchange(ref annBusy, 1, 0) != 0) return;
+			try {
+			EnsureTrackers();
+			bool force = ev == "started" || ev == "completed" || ev == "stopped";
+			List<Trk> due = new List<Trk>();
+			DateTime now = DateTime.UtcNow;
+			lock (trkLock) {
+				for (int i = 0; i < trk.Count; i++) {
+					if (force || trk[i].Next <= now) due.Add(trk[i]);
+				}
+			}
+			if (due.Count == 0) {
+				if (force && ev == "started") Log(1, "no trackers in torrent");
+				return;
+			}
+			if (force) Log(1, "announcing to " + due.Count.ToString(CultureInfo.InvariantCulture) + " tracker(s)");
+			int remaining = due.Count;
+			ManualResetEvent done = new ManualResetEvent(false);
+			for (int i = 0; i < due.Count; i++) {
+				ThreadPool.QueueUserWorkItem(delegate(object state) {
+					Trk tr = (Trk)state;
+					List<string> local = new List<string>();
+					AnnOut result = new AnnOut();
+					try {
+						string scheme = "";
+						try { scheme = new Uri(tr.Url).Scheme.ToLowerInvariant(); } catch { }
+						if (scheme == "udp") QueryUdp(tr.Url, ev, local, result);
+						else if (scheme == "http" || scheme == "https") QueryHttp(tr.Url, ev, local, result);
+						else Log(2, "skip tracker " + tr.Url);
+					} catch (Exception ex) {
+						Log(2, "tracker " + tr.Url + " " + ex.Message);
+					}
+					lock (trkLock) {
+						if (result.Ok) {
+							tr.Fail = 0;
+							tr.Interval = result.Interval >= 60 ? result.Interval : 1800;
+							tr.Next = DateTime.UtcNow.AddSeconds(tr.Interval);
+						} else {
+							tr.Fail++;
+							int back = 60;
+							int f = tr.Fail;
+							if (f > 6) f = 6;
+							for (int k = 1; k < f; k++) back *= 2;
+							if (back > 1800) back = 1800;
+							tr.Next = DateTime.UtcNow.AddSeconds(back);
+						}
+					}
+					for (int k = 0; k < local.Count; k++) RememberPeer(local[k]);
+					if (local.Count > 0)
+						Log(1, local.Count.ToString(CultureInfo.InvariantCulture) + " peers from " + tr.Url);
+					if (Interlocked.Decrement(ref remaining) == 0) done.Set();
+				}, due[i]);
+			}
+			done.WaitOne(ev == "stopped" ? 2000 : (force ? 12000 : 8000));
+			} finally {
+				if (periodic) Interlocked.Exchange(ref annBusy, 0);
+			}
+		}
+
+		void QueryUdp(string url, string ev, List<string> peersOut, AnnOut result) {
 			Session.AcquireAnnounce();
-			try { QueryUdpCore(url, ev, peersOut); }
+			try { QueryUdpCore(url, ev, peersOut, result); }
 			finally { Session.ReleaseAnnounce(); }
 		}
 
-		void QueryUdpCore(string url, string ev, List<string> peersOut) {
+		void QueryUdpCore(string url, string ev, List<string> peersOut, AnnOut result) {
 			if (VpnHub.Blocked) { Log(2, "UDP blocked (VPN down)"); return; }
 			Uri uri;
 			try { uri = new Uri(url); } catch { return; }
@@ -7354,6 +8749,10 @@ namespace PowerTorrent {
 				}
 				if (action != 1) return;
 				int iv = Bt.R32(resp, 8);
+				if (result != null) {
+					result.Ok = true;
+					result.Interval = iv >= 60 ? iv : 1800;
+				}
 				if (iv >= 60) {
 					lock (statusLock) {
 						if (iv < announceInterval) announceInterval = iv;
@@ -7376,13 +8775,13 @@ namespace PowerTorrent {
 			}
 		}
 
-		void QueryHttp(string url, string ev, List<string> peersOut) {
+		void QueryHttp(string url, string ev, List<string> peersOut, AnnOut result) {
 			Session.AcquireAnnounce();
-			try { QueryHttpCore(url, ev, peersOut); }
+			try { QueryHttpCore(url, ev, peersOut, result); }
 			finally { Session.ReleaseAnnounce(); }
 		}
 
-		void QueryHttpCore(string url, string ev, List<string> peersOut) {
+		void QueryHttpCore(string url, string ev, List<string> peersOut, AnnOut result) {
 			try {
 				string sep = url.IndexOf('?') >= 0 ? "&" : "?";
 				int dc = 0, totp = 0; long ver = 0, totb = 0;
@@ -7416,7 +8815,7 @@ namespace PowerTorrent {
 				} else if (VpnHub.OsAllowed) {
 					HttpWebRequest req = (HttpWebRequest)WebRequest.Create(sb.ToString());
 					req.Method = "GET";
-					req.UserAgent = "PowerTorrent/1.2";
+					req.UserAgent = "PowerTorrent/1.4";
 					req.Timeout = 15000;
 					req.ReadWriteTimeout = 15000;
 					req.KeepAlive = false;
@@ -7438,6 +8837,10 @@ namespace PowerTorrent {
 					return;
 				}
 				long iv = dict.GetInt("interval", 0);
+				if (result != null) {
+					result.Ok = true;
+					result.Interval = iv >= 60 ? (int)iv : 1800;
+				}
 				if (iv >= 60) {
 					lock (statusLock) {
 						if ((int)iv < announceInterval) announceInterval = (int)iv;
@@ -7453,8 +8856,12 @@ namespace PowerTorrent {
 						if (d2.Dict == null) continue;
 						string ip = d2.Str("ip");
 						long prt = d2.GetInt("port", 0);
-						if (!string.IsNullOrEmpty(ip) && prt > 0)
-							peersOut.Add(ip + ":" + prt.ToString(CultureInfo.InvariantCulture));
+						if (!string.IsNullOrEmpty(ip) && prt > 0) {
+							string ep = ip.IndexOf(':') >= 0
+								? "[" + ip + "]:" + prt.ToString(CultureInfo.InvariantCulture)
+								: ip + ":" + prt.ToString(CultureInfo.InvariantCulture);
+							peersOut.Add(ep);
+						}
 					}
 				}
 			} catch (Exception ex) {
@@ -7500,108 +8907,20 @@ namespace PowerTorrent {
 		}
 
 		void DhtRun() {
-			string[] boots = new string[] {
-				"router.bittorrent.com:6881",
-				"dht.transmissionbt.com:6881",
-				"router.utorrent.com:6881",
-				"dht.libtorrent.org:25401"
-			};
-			byte[] nid = new byte[20];
-			RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider();
-			rng.GetBytes(nid);
-			rng.Dispose();
-			Queue<string> nodes = new Queue<string>();
-			HashSet<string> tried = new HashSet<string>();
-			for (int i = 0; i < boots.Length; i++) nodes.Enqueue(boots[i]);
-			int queries = 0;
 			int stagger = Session.IndexOf(this);
 			if (stagger < 0) stagger = 0;
 			Thread.Sleep(80 * (stagger % 25));
-			while (running) {
-				if (!settings.EnableDht) { Thread.Sleep(400); continue; }
-				if (VpnHub.Blocked) { Thread.Sleep(400); continue; }
-				if (!VpnHub.TunnelOn && !VpnHub.OsAllowed) { Thread.Sleep(400); continue; }
-				if (pieces != null && pieces.IsComplete) break;
-				if (nodes.Count == 0) {
-					tried.Clear();
-					for (int i = 0; i < boots.Length; i++) nodes.Enqueue(boots[i]);
-					Thread.Sleep(8000);
-					continue;
-				}
-				string n = nodes.Dequeue();
-				if (!tried.Add(n)) continue;
-				queries++;
-				if ((queries % 24) == 0) Thread.Sleep(1500);
-				try {
-					int colon = n.LastIndexOf(':');
-					if (colon <= 0) continue;
-					int p = int.Parse(n.Substring(colon + 1), CultureInfo.InvariantCulture);
-					string h = n.Substring(0, colon);
-					IPAddress ip = Bt.ResolveV4(h);
-					if (ip == null) continue;
-					byte[] tid = new byte[2];
-					tid[0] = (byte)queries;
-					tid[1] = 7;
-					byte[] msg = BuildGetPeers(nid, infoHash, tid);
-					VpnUdpSock vs = null;
-					UdpClient udp = null;
-					IPEndPoint dest = new IPEndPoint(ip, p);
-					try {
-						if (VpnHub.TunnelOn) vs = VpnHub.BindUdp(0);
-						else if (VpnHub.OsAllowed) {
-							udp = new UdpClient();
-							udp.Client.ReceiveTimeout = 2500;
-							udp.Connect(ip, p);
-						} else continue;
-						SendUdp(vs, udp, msg, dest);
-						byte[] resp = RecvUdp(vs, udp, 2500);
-						if (resp == null) continue;
-						Be dict = Benc.Decode(resp);
-						if (dict == null) continue;
-						Be r = dict.Get("r");
-						if (r == null) continue;
-						Be values = r.Get("values");
-						if (values != null && values.List != null) {
-							int added = 0;
-							for (int i = 0; i < values.List.Count; i++) {
-								byte[] v = values.List[i].Bytes;
-								if (v == null || v.Length < 6) continue;
-								List<string> tmp = new List<string>();
-								Bt.AddCompactPeers(v, tmp);
-								for (int k = 0; k < tmp.Count; k++) {
-									RememberPeer(tmp[k]);
-									added++;
-								}
-							}
-							if (added > 0) Log(1, "DHT +" + added.ToString(CultureInfo.InvariantCulture) + " peers from " + n);
-						}
-						Be tok = r.Get("token");
-						if (tok != null && tok.Bytes != null && tok.Bytes.Length > 0 && tok.Bytes.Length <= 64 && boundPort > 0) {
-							byte[] tid2 = new byte[2];
-							tid2[0] = (byte)(queries + 3);
-							tid2[1] = 9;
-							byte[] amsg = BuildAnnouncePeer(nid, infoHash, tok.Bytes, boundPort, tid2);
-							try { SendUdp(vs, udp, amsg, dest); } catch { }
-						}
-						Be nd = r.Get("nodes");
-						if (nd != null && nd.Bytes != null) {
-							byte[] nb = nd.Bytes;
-							int cnt = nb.Length / 26;
-							for (int i = 0; i < cnt; i++) {
-								int o = i * 26 + 20;
-								int np = (nb[o + 4] << 8) | nb[o + 5];
-								if (np <= 0) continue;
-								if (nb[o] == 0 || nb[o] == 127) continue;
-								string ns = string.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}.{3}:{4}", nb[o], nb[o + 1], nb[o + 2], nb[o + 3], np);
-								if (!tried.Contains(ns)) nodes.Enqueue(ns);
-							}
-						}
-					} finally {
-						if (vs != null) VpnHub.DropUdp(vs);
-						try { if (udp != null) udp.Close(); } catch { }
-					}
-				} catch { }
+			Action<string> onPeer = delegate(string ep) { RememberPeer(ep); };
+			Action<int> onDone = delegate(int n) {
+				if (n > 0) Log(1, "DHT +" + n.ToString(CultureInfo.InvariantCulture) + " peers");
+			};
+			while (running && settings.EnableDht) {
+				if (meta != null && meta.Private) break;
+				if (VpnHub.Blocked || (!VpnHub.TunnelOn && !VpnHub.OsAllowed)) { Thread.Sleep(400); continue; }
+				if (boundPort > 0 && infoHash != null) Dht.Want(infoHash, boundPort, onPeer, onDone);
+				Thread.Sleep(1000);
 			}
+			if (infoHash != null) Dht.Unwant(infoHash);
 		}
 
 		void WebseedRun() {
@@ -7679,7 +8998,7 @@ namespace PowerTorrent {
 			if (!VpnHub.OsAllowed) return false;
 			HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
 			req.Method = "GET";
-			req.UserAgent = "PowerTorrent/1.2";
+			req.UserAgent = "PowerTorrent/1.4";
 			req.Timeout = 20000;
 			req.ReadWriteTimeout = 20000;
 			req.AddRange(start, start + n - 1);
@@ -7936,7 +9255,7 @@ function Get-PtDefaultOptions {
 		SearchTpb	   = '0'
 		SearchCsv	   = '0'
 		NoticeAccepted = '0'
-		VpnRequire	   = '0'
+		VpnRequire	   = '1'
 		VpnAuto		   = '1'
 	}
 }
@@ -8542,6 +9861,36 @@ function ConvertFrom-PtVpnIniValue([string]$v) {
 	} catch { return '' }
 }
 
+function Expand-PtOvpnFiles([string]$text, [string]$baseDir) {
+	if ([string]::IsNullOrEmpty($text)) { return $text }
+	if ([string]::IsNullOrWhiteSpace($baseDir)) { $baseDir = Split-Path -Parent (Get-PowerTorrentScriptPath) }
+	$names = @('ca','cert','key','tls-crypt','tls-auth','auth-user-pass')
+	$lines = $text.Replace("`r", '').Split("`n")
+	$out = New-Object System.Collections.Generic.List[string]
+	foreach ($ln in $lines) {
+		$trim = $ln.Trim()
+		if ($trim.Length -eq 0 -or $trim.StartsWith('#') -or $trim.StartsWith(';') -or $trim.StartsWith('<')) {
+			[void]$out.Add($ln)
+			continue
+		}
+		$parts = $trim -split '\s+', 2
+		$k = $parts[0].ToLowerInvariant()
+		$known = $false
+		foreach ($name in $names) { if ($k -eq $name) { $known = $true; break } }
+		if (-not $known -or $parts.Length -lt 2) { [void]$out.Add($ln); continue }
+		$path = $parts[1].Trim().Trim('"').Trim("'")
+		if ([string]::IsNullOrWhiteSpace($path)) { [void]$out.Add($ln); continue }
+		$full = $path
+		if (-not [System.IO.Path]::IsPathRooted($path)) { $full = Join-Path $baseDir $path }
+		if (-not (Test-Path -LiteralPath $full)) { [void]$out.Add($ln); continue }
+		$body = [System.IO.File]::ReadAllText($full).TrimEnd()
+		[void]$out.Add('<' + $k + '>')
+		[void]$out.Add($body)
+		[void]$out.Add('</' + $k + '>')
+	}
+	return ($out -join "`n")
+}
+
 function Test-PtVpnIsSaved {
 	$cur = [string]$script:PtVpnConfigText
 	if ([string]::IsNullOrEmpty($cur)) { return $false }
@@ -8572,6 +9921,7 @@ function Initialize-PtVpn {
 	}
 	try {
 		$err = ''
+		$text = Expand-PtOvpnFiles $text (Split-Path -Parent (Get-PowerTorrentScriptPath))
 		$ok = [PowerTorrent.VpnHub]::LoadConfig($text, [ref]$err)
 		if (-not $ok) {
 			Write-Host ("VPN config: {0}" -f $err) -ForegroundColor Yellow
@@ -8581,6 +9931,12 @@ function Initialize-PtVpn {
 		}
 		$script:PtVpnConfigText = $text
 		if ($fromIni) { $script:PtVpnSavedText = $text }
+		$explicitOff = $false
+		try {
+			$flagIni = Read-PtIni
+			if ($flagIni.ContainsKey('VpnRequire') -and -not (Test-PtIniFlag $flagIni['VpnRequire'])) { $explicitOff = $true }
+		} catch { }
+		if (-not $explicitOff) { $script:PtVpnRequire = $true }
 		[PowerTorrent.VpnHub]::Require = [bool]$script:PtVpnRequire
 		if ([bool]$script:PtVpnAuto) {
 			Write-Host 'Connecting VPN...' -ForegroundColor DarkCyan
@@ -10019,7 +11375,8 @@ function Show-PowerTorrentGui {
 								 ToolTip="Generate a WireGuard or OpenVPN config at AirVPN.org">AirVPN.org</Hyperlink>
 					</TextBlock>
 					<CheckBox x:Name="chkVpnRequire" Content="Killswitch" IsChecked="False" IsEnabled="False"
-							  VerticalAlignment="Center"/>
+							  VerticalAlignment="Center"
+							  ToolTip="Turns on when a VPN config is loaded. Stays off until then."/>
 				  </DockPanel>
 				  <Button x:Name="btnVpnImport" Style="{StaticResource DlgBtn}" HorizontalAlignment="Stretch" Margin="0,0,0,6">
 					<StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
@@ -10539,7 +11896,18 @@ function Show-PowerTorrentGui {
 	}
 	if ($null -eq $script:PtVpnRequire) { $script:PtVpnRequire = $false }
 	if ($null -eq $script:PtVpnAuto) { $script:PtVpnAuto = $true }
-	if ($ui.chkVpnRequire) { $ui.chkVpnRequire.IsChecked = [bool]$script:PtVpnRequire }
+	if ($ui.chkVpnRequire) {
+		$vpnReady = $false
+		try { $vpnReady = [bool][PowerTorrent.VpnHub]::HasConfig } catch { }
+		$ui.chkVpnRequire.IsEnabled = $vpnReady
+		if (-not $vpnReady) {
+			$ui.chkVpnRequire.IsChecked = $false
+			$script:PtVpnRequire = $false
+			try { [PowerTorrent.VpnHub]::Require = $false } catch { }
+		} else {
+			$ui.chkVpnRequire.IsChecked = [bool]$script:PtVpnRequire
+		}
+	}
 	if (-not $script:PtTheme) { $script:PtTheme = 'Ice' }
 	foreach ($tn in @(Get-PtThemeNames)) { [void]$ui.cmbTheme.Items.Add($tn) }
 	$themePick = 'Ice'
@@ -11073,6 +12441,7 @@ function Show-PowerTorrentGui {
 				$dlg.Title = 'Import VPN config'
 				if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
 				$text = [System.IO.File]::ReadAllText($dlg.FileName)
+				$text = Expand-PtOvpnFiles $text (Split-Path -Parent $dlg.FileName)
 				$err = ''
 				$ok = [PowerTorrent.VpnHub]::LoadConfig($text, [ref]$err)
 				if (-not $ok) {
@@ -12593,7 +13962,7 @@ if ([string]::IsNullOrWhiteSpace($SavePath)) {
 if (-not (Confirm-PowerTorrentNotice)) { exit 1 }
 
 Write-Host ''
-Write-Host '  PowerTorrent 1.3	|  Windows PowerShell 5.1  |  no dependencies' -ForegroundColor Cyan
+Write-Host '  PowerTorrent 1.4	|  Windows PowerShell 5.1  |  no dependencies' -ForegroundColor Cyan
 Write-Host '  =================================================================' -ForegroundColor Cyan
 
 $cfg = New-PowerTorrentSettings -Source $source -OutDir $SavePath -ListenPort $Port -Peers $MaxPeers `
