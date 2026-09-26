@@ -963,7 +963,7 @@ namespace PowerTorrent {
 		}
 		public static byte[] MakePeerId() {
 			byte[] id = new byte[20];
-			byte[] prefix = Encoding.ASCII.GetBytes("-PT1400-");
+			byte[] prefix = Encoding.ASCII.GetBytes("-PT1500-");
 			Buffer.BlockCopy(prefix, 0, id, 0, 8);
 			RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider();
 			byte[] r = new byte[12];
@@ -3906,6 +3906,8 @@ namespace PowerTorrent {
 			byte[] back = new byte[pt.Length + 8];
 			if (!ChaChaPoly.OpenInto(k, 7, into, 0, intoN, back, 3)) return "aead-openinto";
 			for (int i = 0; i < pt.Length; i++) if (back[3 + i] != pt[i]) return "aead-openinto-pt";
+			if (ParsePlainV4(Encoding.ASCII.GetBytes("203.0.113.5\n")) != "203.0.113.5") return "probe-parse";
+			if (ParsePlainV4(Encoding.ASCII.GetBytes("10.1.1.1\n")) != null) return "probe-priv";
 			string cc = TcpCcSelfCheck();
 			if (cc != null) return cc;
 			return null;
@@ -4134,6 +4136,10 @@ namespace PowerTorrent {
 		internal static VpnTcp ConnectTcp(string host, int port, int timeoutMs) {
 			if (!up) return null;
 			IPAddress ip = Bt.ResolveV4(host); if (ip == null) return null;
+			return ConnectTcp(ip, port, timeoutMs);
+		}
+		internal static VpnTcp ConnectTcp(IPAddress ip, int port, int timeoutMs) {
+			if (!up || ip == null) return null;
 			VpnTcp t = new VpnTcp();
 			t.locIp = localIp; t.remIp = IpToU(ip); t.remPort = (ushort)port;
 			lock (gate) { t.locPort = nextEph++; if (nextEph < 40000) nextEph = 40000; }
@@ -4203,7 +4209,7 @@ namespace PowerTorrent {
 
 		public static bool HttpGet(string url, int timeoutMs, string ua, out int status, out byte[] body) {
 			status = 0; body = null;
-			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.4";
+			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.5";
 			if (up) return HttpRequest(url, timeoutMs, -1, -1, ua, out status, out body);
 			if (Require && HasConfig) return false;
 			return HttpOsGetBytes(url, timeoutMs, ua, out status, out body);
@@ -4246,15 +4252,20 @@ namespace PowerTorrent {
 			} catch { return false; }
 		}
 		public static bool HttpRequest(string url, int timeoutMs, long rangeStart, long rangeEnd, out int status, out byte[] body) {
-			return HttpRequest(url, timeoutMs, rangeStart, rangeEnd, "PowerTorrent/1.4", out status, out body);
+			return HttpRequest(url, timeoutMs, rangeStart, rangeEnd, "PowerTorrent/1.5", out status, out body);
 		}
 		public static bool HttpRequest(string url, int timeoutMs, long rangeStart, long rangeEnd, string ua, out int status, out byte[] body) {
+			return HttpRequest(url, timeoutMs, rangeStart, rangeEnd, ua, false, out status, out body);
+		}
+		static bool HttpRequest(string url, int timeoutMs, long rangeStart, long rangeEnd, string ua, bool probeDns, out int status, out byte[] body) {
 			status = 0; body = null;
 			if (!up) return false;
-			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.4";
+			if (string.IsNullOrEmpty(ua)) ua = "PowerTorrent/1.5";
 			Uri u; try { u = new Uri(url); } catch { return false; }
 			int port = u.Port; if (port <= 0) port = string.Equals(u.Scheme, "https", StringComparison.OrdinalIgnoreCase) ? 443 : 80;
-			VpnTcp t = ConnectTcp(u.Host, port, timeoutMs); if (t == null) return false;
+			IPAddress ip = probeDns ? ResolveProbe(u.Host) : Bt.ResolveV4(u.Host);
+			if (ip == null) return false;
+			VpnTcp t = ConnectTcp(ip, port, timeoutMs); if (t == null) return false;
 			try {
 				Stream raw = new VpnTcpStream(t);
 				Stream s = raw;
@@ -4335,18 +4346,78 @@ namespace PowerTorrent {
 				}
 			} catch { return null; }
 		}
-		static string ProbeOsOnce() {
-			string[] urls = new string[] {
-				"https://ip.me/",
-				"http://ip.me/",
-				"https://api.ipify.org/",
-				"https://icanhazip.com/"
-			};
-			for (int u = 0; u < urls.Length; u++) {
-				string ip = HttpOsGet(urls[u], 8000);
-				if (ip != null) return ip;
-			}
+		static string ProbeCurl() {
+			try {
+				System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo();
+				psi.FileName = "curl.exe";
+				psi.Arguments = "-4 -fsS --max-time 8 ip.me";
+				psi.UseShellExecute = false;
+				psi.RedirectStandardOutput = true;
+				psi.CreateNoWindow = true;
+				System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi);
+				if (p == null) return null;
+				try {
+					string o = p.StandardOutput.ReadToEnd();
+					if (!p.WaitForExit(12000)) {
+						try { p.Kill(); } catch { }
+						return null;
+					}
+					if (p.ExitCode != 0) return null;
+					return ParsePlainV4(Encoding.ASCII.GetBytes(o == null ? "" : o));
+				} finally { try { p.Dispose(); } catch { } }
+			} catch { return null; }
+		}
+		static IPAddress FirstOsV4(string host) {
+			try {
+				IPAddress[] addrs = Dns.GetHostAddresses(host);
+				for (int i = 0; i < addrs.Length; i++) {
+					if (addrs[i].AddressFamily == AddressFamily.InterNetwork) return addrs[i];
+				}
+			} catch { }
 			return null;
+		}
+		static string ParseHttpBodyIp(byte[] raw) {
+			if (raw == null || raw.Length == 0) return null;
+			string text = Encoding.ASCII.GetString(raw);
+			int sp = text.IndexOf("\r\n\r\n");
+			if (sp >= 0) return ParsePlainV4(Slice(raw, sp + 4, raw.Length - (sp + 4)));
+			return ParsePlainV4(raw);
+		}
+		static string HttpOsPlain(IPAddress ip, int port, bool tls) {
+			TcpClient c = new TcpClient(AddressFamily.InterNetwork);
+			try {
+				IAsyncResult ar = c.BeginConnect(ip, port, null, null);
+				if (!ar.AsyncWaitHandle.WaitOne(8000, false)) return null;
+				c.EndConnect(ar);
+				c.ReceiveTimeout = 8000;
+				c.SendTimeout = 8000;
+				Stream s = c.GetStream();
+				if (tls) {
+					SslStream ssl = new SslStream(s, false);
+					ssl.AuthenticateAsClient("ip.me");
+					s = ssl;
+				}
+				byte[] req = Encoding.ASCII.GetBytes("GET / HTTP/1.0\r\nHost: ip.me\r\nUser-Agent: curl/8.4.0\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+				s.Write(req, 0, req.Length);
+				MemoryStream ms = new MemoryStream();
+				byte[] buf = new byte[2048];
+				int n, total = 0;
+				while (total < 8192 && (n = s.Read(buf, 0, buf.Length)) > 0) {
+					ms.Write(buf, 0, n);
+					total += n;
+				}
+				return ParseHttpBodyIp(ms.ToArray());
+			} catch { return null; }
+			finally { try { c.Close(); } catch { } }
+		}
+		static string ProbeOsOnce() {
+			string ip = ProbeCurl();
+			if (ip != null) return ip;
+			IPAddress v4 = FirstOsV4("ip.me");
+			if (v4 == null) return null;
+			ip = HttpOsPlain(v4, 80, false);
+			if (ip != null) return ip;
+			return HttpOsPlain(v4, 443, true);
 		}
 		static string ParsePlainV4(byte[] body) {
 			if (body == null || body.Length == 0) return null;
@@ -4367,26 +4438,25 @@ namespace PowerTorrent {
 			if (p == 192 && b[1] == 168) return null;
 			return a.ToString();
 		}
+		static IPAddress ResolveProbe(string host) {
+			IPAddress parsed;
+			if (IPAddress.TryParse(host, out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork) return parsed;
+			if (dnsIp != 0) {
+				IPAddress via = Resolve(host);
+				if (via != null) return via;
+			}
+			return FirstOsV4(host);
+		}
 		static string ProbeOnce() {
 			if (!up) return null;
-			string[] urls = new string[] {
-				"https://api.ipify.org/",
-				"https://icanhazip.com/",
-				"https://ifconfig.me/ip",
-				"https://ip.me/",
-				"http://ip.me/"
-			};
-			string first = null;
-			int agree = 0;
+			string[] urls = new string[] { "http://ip.me/", "https://ip.me/" };
 			for (int u = 0; u < urls.Length && up; u++) {
 				int st; byte[] body;
-				if (!HttpRequest(urls[u], 10000, -1, -1, "curl/8.4.0", out st, out body) || body == null) continue;
+				if (!HttpRequest(urls[u], 10000, -1, -1, "curl/8.4.0", true, out st, out body) || body == null) continue;
 				string ip = ParsePlainV4(body);
-				if (ip == null) continue;
-				if (first == null) { first = ip; agree = 1; }
-				else if (ip == first) { agree++; if (agree >= 2) return ip; }
+				if (ip != null) return ip;
 			}
-			return first;
+			return null;
 		}
 		static void ProbeWorker(object state) {
 			int g = (int)state;
@@ -4395,7 +4465,7 @@ namespace PowerTorrent {
 			for (int i = 0; i < 4 && up && g == probeGen; i++) {
 				try {
 					if (vpnIp == null) vpnIp = ProbeOnce();
-					if (osIp == null && !(Require && HasConfig)) osIp = ProbeOsOnce();
+					if (osIp == null) osIp = ProbeOsOnce();
 					if (g != probeGen) return;
 					if (vpnIp != null) ProvenIp = vpnIp;
 					if (osIp != null) DirectIp = osIp;
@@ -7566,7 +7636,7 @@ namespace PowerTorrent {
 				Dictionary<string, Be> root = new Dictionary<string, Be>();
 				root["m"] = Be.FromDict(m);
 				if (eng.boundPort > 0) root["p"] = Be.Int(eng.boundPort);
-				root["v"] = Be.Blob(Encoding.UTF8.GetBytes("PowerTorrent/1.4"));
+				root["v"] = Be.Blob(Encoding.UTF8.GetBytes("PowerTorrent/1.5"));
 				if (eng.settings.EnableEncrypt) root["e"] = Be.Int(1);
 				if (eng.rawInfo != null) root["metadata_size"] = Be.Int(eng.rawInfo.Length);
 				SendExt(0, Benc.Encode(Be.FromDict(root)));
@@ -9425,7 +9495,7 @@ namespace PowerTorrent {
 				} else if (VpnHub.OsAllowed) {
 					HttpWebRequest req = (HttpWebRequest)WebRequest.Create(sb.ToString());
 					req.Method = "GET";
-					req.UserAgent = "PowerTorrent/1.4";
+					req.UserAgent = "PowerTorrent/1.5";
 					req.Timeout = 15000;
 					req.ReadWriteTimeout = 15000;
 					req.KeepAlive = false;
@@ -9608,7 +9678,7 @@ namespace PowerTorrent {
 			if (!VpnHub.OsAllowed) return false;
 			HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
 			req.Method = "GET";
-			req.UserAgent = "PowerTorrent/1.4";
+			req.UserAgent = "PowerTorrent/1.5";
 			req.Timeout = 20000;
 			req.ReadWriteTimeout = 20000;
 			req.AddRange(start, start + n - 1);
@@ -12907,8 +12977,9 @@ function Show-PowerTorrentGui {
 				$ui.lblFooter.Text = 'VPN: ON'
 				$proven = [string][PowerTorrent.VpnHub]::ProvenIp
 				$direct = [string][PowerTorrent.VpnHub]::DirectIp
-				$outTxt = $(if ($direct) { $direct } else { 'checking' })
-				$vpnTxt = $(if ($proven) { $proven } else { 'checking' })
+				$done = [bool][PowerTorrent.VpnHub]::ProbeDone
+				$outTxt = $(if ($direct) { $direct } elseif ($done) { 'unavailable' } else { 'checking' })
+				$vpnTxt = $(if ($proven) { $proven } elseif ($done) { 'unavailable' } else { 'checking' })
 				$tip = "Outside IP: $outTxt`nVPN IP: $vpnTxt"
 				if ($direct -and $proven) {
 					if ($direct -eq $proven) { $tip = $tip + "`nVPN check failed" }
@@ -14578,7 +14649,7 @@ if ([string]::IsNullOrWhiteSpace($SavePath)) {
 if (-not (Confirm-PowerTorrentNotice)) { exit 1 }
 
 Write-Host ''
-Write-Host '  PowerTorrent 1.4	|  Windows PowerShell 5.1  |  no dependencies' -ForegroundColor Cyan
+Write-Host '  PowerTorrent 1.5	|  Windows PowerShell 5.1  |  no dependencies' -ForegroundColor Cyan
 Write-Host '  =================================================================' -ForegroundColor Cyan
 
 $cfg = New-PowerTorrentSettings -Source $source -OutDir $SavePath -ListenPort $Port -Peers $MaxPeers `
